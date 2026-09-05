@@ -5,8 +5,14 @@ edition.workspace = true
 
 [dependencies]
 metainfo = { path = "../metainfo" }
+tracker = { path = "../tracker" }
+peer-wire = { path = "../peer-wire" }
 anyhow = "1"
-tokio = { version = "1", features = ["full"] }
+sha1.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[dev-dependencies]
+hex.workspace = true
 
 [lints]
 workspace = true

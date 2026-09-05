@@ -1,0 +1,15 @@
+[package]
+name = "peer-wire"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+
+[dev-dependencies]
+sha1.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

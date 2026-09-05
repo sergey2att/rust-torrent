@@ -1,0 +1,18 @@
+[package]
+name = "tracker"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bencode = { path = "../bencode" }
+thiserror.workspace = true
+reqwest.workspace = true
+percent-encoding.workspace = true
+url.workspace = true
+fastrand.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

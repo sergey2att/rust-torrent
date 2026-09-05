@@ -18,6 +18,11 @@ edition = "2021"
 thiserror = "1"
 sha1 = "0.10"
 hex = "0.4"
+tokio = { version = "1", default-features = false }
+reqwest = "0.12"
+percent-encoding = "2"
+url = "2"
+fastrand = "2"
 
 # Линты: дефолт clippy + наши стилевые правила проекта.
 # Дефолтные (warn by default) остаются; здесь — надбавка.
