@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# Крейты будущих этапов (создаются своими этапами, members = ["crates/*"] подхватит их сам):
+#   tracker       — HTTP-announce (этап 2), UDP-announce (этап 4)
+#   peer-wire     — handshake + фрейминг сообщений пиров (этапы 2, 6)
+#   engine        — менеджер кусков, дисковый слой, оркестрация (этапы 3, 4)
+#   dht           — Kademlia DHT (этап 5)
+#   ext-metadata  — extension protocol + ut_metadata (этап 5)
+#   ext-pex       — ut_pex (этап 6)
+#   nat           — UPnP/NAT-PMP (этап 6)
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+thiserror = "1"
+sha1 = "0.10"
+hex = "0.4"

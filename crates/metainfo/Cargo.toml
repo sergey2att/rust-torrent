@@ -1,0 +1,12 @@
+[package]
+name = "metainfo"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bencode = { path = "../bencode" }
+thiserror.workspace = true
+sha1.workspace = true
+
+[dev-dependencies]
+hex.workspace = true

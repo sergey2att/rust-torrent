@@ -1,0 +1,13 @@
+# Rust / Cargo
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+
+# Локальное состояние инструментов агента
+.pi/
