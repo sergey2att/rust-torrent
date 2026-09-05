@@ -32,18 +32,27 @@ crates/
 ## Команды
 
 ```bash
-cargo test                      # все тесты (офлайн, сетевых нет)
-cargo test -p metainfo          # один крейт
-cargo run -p cli -- <file.torrent>   # печать метаданных торрента
-cargo clippy --all-targets      # must be clean
-cargo fmt                       # форматирование перед коммитом
+cargo test                              # все тесты (офлайн, сетевых нет)
+cargo test -p metainfo                  # один крейт
+cargo run -p cli -- <file.torrent>      # печать метаданных торрента
+cargo clippy --all-targets -- -D warnings   # must be clean (0 warnings)
+cargo fmt                               # форматирование перед коммитом
 ```
+
+## Линты
+
+Линты заданы на уровне workspace (`[workspace.lints]` в корневом `Cargo.toml`), крейты подключают через `[lints] workspace = true`:
+
+- `unsafe_code = "deny"`, `missing_docs = "warn"` — публичный API обязан быть задокументирован
+- `clippy::pedantic = "warn"` (поверх дефолта); шумные для проекта линты выключаются в том же блоке с комментарием
+- `clippy::unwrap_used` / `clippy::expect_used` = "deny" — стилевое правило «никаких unwrap в библиотеках» проверяется машинно; в тест-файлах — локальный `#![allow(clippy::unwrap_used, clippy::expect_used)]` в шапке
+- Новые линты добавляем в `[workspace.lints]`, не в атрибуты крейтов
 
 Rust ставится через rustup: `source "$HOME/.cargo/env"` в новой оболочке.
 
 ## Стиль кода
 
-- Никаких `unwrap()`/`expect()` в библиотечных крейтах — только `Result` с типизированными ошибками
+- Никаких `unwrap()`/`expect()` в библиотечных крейтах — enforced линтами `clippy::unwrap_used`/`expect_used` (deny); в тестах разрешено
 - Публичные функции и структуры — с doc-комментариями (`///`)
 - `unsafe` — только с явным обоснованием в комментарии
 - Единицы измерения в именах, где неочевидно (`timeout_ms`, `piece_length_bytes`)

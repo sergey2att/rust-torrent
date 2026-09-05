@@ -1,3 +1,6 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // тесты вправе паниковать
+//! Тесты разбора .torrent: single/multi, BEP 12, ошибки, `info_hash`.
+
 use bencode::{encode, BValue};
 use metainfo::{parse_torrent_file, FileMode, MetainfoError};
 use sha1::{Digest, Sha1};
@@ -24,8 +27,9 @@ fn int(n: i64) -> BValue {
     BValue::Int(n)
 }
 
-/// Строит торрент: словарь info сериализуется отдельно, чтобы info_hash был
-/// вычислен по тем же правилам, что и в клиенте (SHA-1 от байт info).
+/// Строит торрент: словарь info сериализуется отдельно, чтобы `info_hash` был
+/// вычислен по тем же правилам, что и в клиенте (SHA-1 от байт `info`).
+#[allow(clippy::needless_pass_by_value)] // хелпер теста, читаемость вызовов важнее
 fn build_torrent(extra_root: Vec<(BValue, BValue)>, info_dict: BValue) -> Vec<u8> {
     let info_bytes = encode(&info_dict);
     // В реальном .torrent info — вложенный словарь; декодируем сериализованные
@@ -98,7 +102,7 @@ fn multi_file_torrent() {
             assert_eq!(files[1].path, vec!["sub", "b.bin"]);
             assert_eq!(files[1].length, 200);
         }
-        other => panic!("ожидался Multi, получен {other:?}"),
+        FileMode::Single { .. } => panic!("ожидался Multi, получен Single"),
     }
     assert_eq!(torrent.info.total_length(), 300);
     assert_eq!(torrent.info.piece_count(), 1);

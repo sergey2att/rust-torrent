@@ -29,7 +29,7 @@ async fn main() -> Result<()> {
         }
     }
     match &torrent.info.mode {
-        metainfo::FileMode::Single { length } => println!("mode:         single, {} байт", length),
+        metainfo::FileMode::Single { length } => println!("mode:         single, {length} байт"),
         metainfo::FileMode::Multi { files } => {
             println!("mode:         multi, {} файл(ов)", files.len());
             for f in files {
@@ -41,5 +41,6 @@ async fn main() -> Result<()> {
 }
 
 fn hex_str(hash: &[u8; 20]) -> String {
-    hash.iter().map(|b| format!("{b:02x}")).collect()
+    hash.iter()
+        .fold(String::new(), |acc, b| format!("{acc}{b:02x}"))
 }

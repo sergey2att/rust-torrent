@@ -10,3 +10,6 @@ sha1.workspace = true
 
 [dev-dependencies]
 hex.workspace = true
+
+[lints]
+workspace = true

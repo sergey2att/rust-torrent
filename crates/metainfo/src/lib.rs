@@ -42,10 +42,16 @@ pub struct Info {
 /// Режим торрента.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileMode {
-    /// Однофайловый: поле `length`.
-    Single { length: u64 },
-    /// Многофайловый: поле `files`.
-    Multi { files: Vec<FileEntry> },
+    /// Однофайловый торрент.
+    Single {
+        /// Общая длина данных в байтах (поле `length`).
+        length: u64,
+    },
+    /// Многофайловый торрент.
+    Multi {
+        /// Файлы в порядке их перечисления в поле `files`.
+        files: Vec<FileEntry>,
+    },
 }
 
 /// Файл в многофайловом торренте.
@@ -75,14 +81,19 @@ impl Info {
 /// Ошибка разбора .torrent-файла.
 #[derive(Debug, thiserror::Error)]
 pub enum MetainfoError {
+    /// Ошибка bencode-декодера.
     #[error("bencode: {0}")]
     Decode(#[from] BencodeError),
+    /// Обязательное поле отсутствует или имеет не тот тип.
     #[error("missing or invalid field: {0}")]
     InvalidField(&'static str),
+    /// Обязательное строковое поле не является валидным UTF-8.
     #[error("field {0} is not valid UTF-8")]
     NotUtf8(&'static str),
+    /// Поле `pieces` не кратно 20 байтам (длина SHA-1).
     #[error("pieces length {0} is not a multiple of 20")]
     BadPiecesLength(usize),
+    /// После корневого словаря есть посторонние данные.
     #[error("trailing data after bencode dictionary")]
     TrailingData,
 }
@@ -123,8 +134,8 @@ fn parse_info(value: &BValue) -> Result<Info, MetainfoError> {
     let dict = as_dict(value).ok_or(MetainfoError::InvalidField("info"))?;
 
     let piece_length = as_int(dict.get(b"piece length".as_slice()))
+        .and_then(|n| u64::try_from(n).ok())
         .filter(|&n| n > 0)
-        .map(|n| n as u64)
         .ok_or(MetainfoError::InvalidField("piece length"))?;
 
     let pieces_raw =
@@ -142,8 +153,7 @@ fn parse_info(value: &BValue) -> Result<Info, MetainfoError> {
         }
     } else {
         let length = as_int(dict.get(b"length".as_slice()))
-            .filter(|&n| n >= 0)
-            .map(|n| n as u64)
+            .and_then(|n| u64::try_from(n).ok())
             .ok_or(MetainfoError::InvalidField("length"))?;
         FileMode::Single { length }
     };
@@ -162,8 +172,7 @@ fn parse_files(value: &BValue) -> Result<Vec<FileEntry>, MetainfoError> {
         .map(|entry| {
             let dict = as_dict(entry).ok_or(MetainfoError::InvalidField("files"))?;
             let length = as_int(dict.get(b"length".as_slice()))
-                .filter(|&n| n >= 0)
-                .map(|n| n as u64)
+                .and_then(|n| u64::try_from(n).ok())
                 .ok_or(MetainfoError::InvalidField("files"))?;
             let path_list = as_list(
                 dict.get(b"path".as_slice())
@@ -171,7 +180,7 @@ fn parse_files(value: &BValue) -> Result<Vec<FileEntry>, MetainfoError> {
             )
             .ok_or(MetainfoError::InvalidField("path"))?;
             let mut path = Vec::with_capacity(path_list.len());
-            for component in path_list.iter() {
+            for component in path_list {
                 path.push(as_utf8(Some(component), "path")?);
             }
             Ok(FileEntry { path, length })

@@ -1,3 +1,6 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)] // тесты вправе паниковать
+//! Табличные кейсы bencode и отклонение некорректных данных.
+
 use bencode::{decode, decode_top_dict_with_spans, encode, BValue, BencodeError};
 use std::collections::BTreeMap;
 

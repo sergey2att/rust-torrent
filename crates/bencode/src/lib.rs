@@ -42,12 +42,16 @@ pub type TopDictWithSpans = BTreeMap<Vec<u8>, Spanned>;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum BencodeError {
     #[error("unexpected end of input")]
+    /// Ввод кончился раньше, чем ожидалось полное значение.
     UnexpectedEof,
     #[error("invalid integer encoding at offset {0}")]
+    /// Целое не соответствует канонической форме или не влезает в i64.
     InvalidInteger(usize),
     #[error("invalid string length at offset {0}")]
+    /// Длина строки не соответствует канонической форме (отрицательная, ведущий нуль).
     InvalidStringLength(usize),
     #[error("unknown value type at offset {0}")]
+    /// Байт не начинает ни один из четырёх типов значений bencode.
     UnknownType(usize),
     /// Ввод недоверенный: вложенность превысила [`MAX_DEPTH`].
     #[error("nesting depth exceeds limit at offset {0}")]
@@ -98,7 +102,7 @@ fn encode_into(value: &BValue, out: &mut Vec<u8>) {
         BValue::Int(n) => {
             out.push(b'i');
             // ponytail: write! в Vec<u8> не падает, ошибка игнорируется намеренно.
-            let _ = std::io::Write::write_fmt(out, format_args!("{}e", n));
+            let _ = std::io::Write::write_fmt(out, format_args!("{n}e"));
         }
         BValue::Bytes(bytes) => {
             // ponytail: write! в Vec<u8> не падает, ошибка игнорируется намеренно.
@@ -241,8 +245,8 @@ fn parse_int(input: &[u8], pos: usize) -> Result<(i64, Range<usize>), BencodeErr
         .parse()
         .map_err(|_| BencodeError::InvalidInteger(pos))?; // переполнение i64
     let n = if negative {
-        if magnitude <= i64::MAX as u64 {
-            Some(-(magnitude as i64))
+        if i64::try_from(magnitude).is_ok() {
+            Some(-magnitude.cast_signed())
         } else if magnitude == i64::MAX as u64 + 1 {
             Some(i64::MIN)
         } else {
@@ -258,8 +262,8 @@ fn parse_int(input: &[u8], pos: usize) -> Result<(i64, Range<usize>), BencodeErr
 }
 
 /// Разбирает строку `<длина>:<байты>`: канонические цифры длины, длина больше
-/// остатка буфера — UnexpectedEof (усечение), отрицательная/с ведущим нулём —
-/// InvalidStringLength.
+/// остатка буфера — `UnexpectedEof` (усечение), отрицательная/с ведущим нулём —
+/// `InvalidStringLength`.
 fn parse_bytes(input: &[u8], pos: usize) -> Result<(Vec<u8>, Range<usize>), BencodeError> {
     let mut cur = pos;
     while matches!(input.get(cur), Some(b'0'..=b'9')) {
