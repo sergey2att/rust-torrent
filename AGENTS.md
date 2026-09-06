@@ -17,10 +17,10 @@ BitTorrent-клиент на Rust. Бесплатный, целевая плат
 crates/
 ├── bencode/       # кодек bencode (этап 1) ✅
 ├── metainfo/      # разбор .torrent, info-hash (этап 1) ✅
-├── tracker/       # HTTP-announce (этап 2) ✅, UDP-announce (этап 4)
+├── tracker/       # HTTP-announce (этап 2) ✅, UDP-announce (этап 4) ✅
 ├── peer-wire/     # handshake + фрейминг сообщений пиров (этап 2) ✅, этап 6 — расширения
 ├── cli/           # бинарник для сквозной проверки этапов ✅ (этап 3: полное скачивание)
-├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce — этап 4
+├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce/seeding (этап 4) ✅
 ├── dht/           # Kademlia DHT (этап 5)                               — ещё не создан
 ├── ext-metadata/  # extension protocol + ut_metadata (этап 5)           — ещё не создан
 ├── ext-pex/       # ut_pex (этап 6)                                     — ещё не создан
@@ -138,8 +138,21 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 1. ✅ Bencode и структура .torrent
 2. ✅ HTTP-announce + peer handshake (сквозной цикл проверен на живом торренте Debian 13.6)
 3. ✅ Менеджер кусков, дисковый слой, пайплайн скачивания (приёмка: Debian 13.6 netinst 755 МБ, SHA-256 совпал с официальным)
-4. UDP-трекеры + NAT через порт (engine)
+4. ✅ UDP-трекеры + seeding/choking (NAT через порт — этап 6)
 5. DHT, magnet-ссылки, extension protocol + ut_metadata
 6. ut_pex, UPnP/NAT-PMP, полировка peer-wire
 
 Каждый новый этап начинается с прожарки требований (grill), итоги — в `GRILL-ME-stage<N>.md`.
+
+## Решения этапа 4 (не менять без обсуждения)
+
+Полный разбор — в `GRILL-ME-stage4.md`. Ключевое:
+
+- **UDP-announce (BEP 15)**: stateless — каждый announce = connect → announce, connection_id не кэшируется (single-torrent сессия, hit rate кэша ~0%). Ретраи строго по спеке: 15 с × 2ⁿ, 8 попыток, шов для тестов — внутренняя `announce_udp_impl(base: Duration)`; после 8-й — `TrackerError::Timeout`. Поле `key` генерируется раз на сессию (`tracker::session_key()`), numwant None → `0xFFFFFFFF`. Ловушка: UDP-коды событий не по порядку enum (completed=1, started=2, stopped=3) — тест на маппинг.
+- **Единый `tracker::announce(url)`**: udp → lookup_host (предпочитаем IPv4) → `announce_udp`; http(s) → `announce_http`; иное → `UnsupportedScheme`. Путь в udp:// игнорируется. Engine анонсирует только через него.
+- **Анонсы не блокируют сессию**: отдельный актор, задачи без перекрытий, результат — `HubEvent::Announce`; при ошибке дедлайн через 30 с. Teardown шлёт Stopped и ждёт актора ≤10 с, потом abort.
+- **Единая `session()`**: recheck диска при старте (spawn_blocking, per-piece события, хранилище возвращается хабу в `RecheckDone`) → скачивание недостающего → раздача до shutdown (или закрытия канала). `download()` — тонкая обёртка с авто-остановкой (bind порта там же, занят — ошибка). Сессия с полными с старта данными и seed=false завершается сразу после recheck.
+- **Входящие соединения**: port выбирает вызывающий (cli 6881, тесты — 0). Accept-луп в engine + `peer_wire::accept_handshake` (чужой info_hash — тихое закрытие). После handshake пир получает наш битфилд (диск-подтверждённые куски) — отправляется один раз, дальше только Have-free протокол запросов.
+- **Отдача**: request от interested+unchoke пира → валидация диапазона (len 0 / >128 КиБ / вне куска → Disconnect) → `DiskCommand::ReadBlock` в общий диск-таск → Piece. Служатся только диск-подтверждённые куски (recheck + ack'и записи). Чужие Cancel игнорируются. uploaded — реальный счётчик в анонсе и Progress.
+- **Choking**: round-robin окно по заинтересованным пирам + optimistic-слот, ротация каждым recompute (10 с и по событию Interested), diff (Unchoke/Choke) минимальный. `ChokeManager` — чистая структура, политика локальна в `recompute`; tit-for-tat — оптимизация.
+- **Ловушка фикстур**: тестовый торрент с нулевым куском 0 «скачивается» recheck'ом из sparse-нулевой преаллокации — данные фикстур не должны совпадать с нулями.

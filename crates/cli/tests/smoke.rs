@@ -36,6 +36,7 @@ async fn real_announce_and_handshake() {
             left: torrent.info.total_length(),
             event: Some(tracker::Event::Started),
             numwant: Some(10),
+            key: tracker::session_key(),
         },
     )
     .await
@@ -94,7 +95,7 @@ async fn full_download_debian_netinst() {
     let started = std::time::Instant::now();
     let files = tokio::time::timeout(
         Duration::from_secs(3600),
-        engine::download(torrent, dir.path(), Some(tx)),
+        engine::download(torrent, dir.path(), 6881, Some(tx)),
     )
     .await
     .expect("скачивание дольше часа")
@@ -116,4 +117,44 @@ async fn full_download_debian_netinst() {
 
     // Прогресс-канал работал до конца.
     while rx.try_recv().is_ok() {}
+}
+
+/// Приёмка этапа 4: announce к реальному публичному UDP-трекеру через
+/// единый dispatcher `tracker::announce` (DNS + BEP 15) должен вернуть
+/// валидный ответ без ошибки.
+#[tokio::test]
+#[ignore = "ручной smoke: нужен интернет и доступный UDP-трекер"]
+async fn real_udp_announce() {
+    let bytes = std::fs::read(format!(
+        "{}/../metainfo/tests/fixtures/ubuntu-live-server.torrent",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let torrent = metainfo::parse_torrent_file(&bytes).unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(120),
+        tracker::announce(
+            "udp://tracker.opentrackr.org:1337/announce",
+            &tracker::AnnounceRequest {
+                info_hash: torrent.info_hash,
+                peer_id: tracker::peer_id(),
+                port: 6881,
+                uploaded: 0,
+                downloaded: 0,
+                left: torrent.info.total_length(),
+                event: Some(tracker::Event::Started),
+                numwant: Some(10),
+                key: tracker::session_key(),
+            },
+        ),
+    )
+    .await
+    .expect("UDP-announce дольше двух минут")
+    .expect("UDP-announce не удался");
+    println!(
+        "interval: {} с, пиров: {}",
+        response.interval,
+        response.peers.len()
+    );
+    assert!(response.interval > 0, "трекер вернул невалидный interval");
 }

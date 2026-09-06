@@ -1,9 +1,14 @@
-//! HTTP-announce трекерам (BEP 3) поверх крейта `bencode`.
+//! Announce трекерам: HTTP (BEP 3) и UDP (BEP 15) поверх крейта `bencode`.
 //!
-//! Запрос — HTTP GET к URL из `announce` с query-параметрами; `info_hash` и
-//! `peer_id` кодируются процентным кодированием по сырым байтам (не hex!).
-//! Ответ — bencoded словарь: компактный формат пиров (основной) или список
-//! словарей (фолбэк).
+//! Запрос — HTTP GET к URL из `announce` с query-параметрами либо UDP-обмен
+//! connect→announce; `info_hash` и `peer_id` кодируются процентным
+//! кодированием по сырым байтам (не hex!). Ответ — bencoded словарь:
+//! компактный формат пиров (основной) или список словарей (фолбэк).
+//! Единая точка входа — [`announce`], диспетчеризующая по схеме URL.
+
+mod udp;
+
+pub use udp::announce_udp;
 
 use bencode::{BValue, BencodeError};
 use percent_encoding::{percent_encode, AsciiSet, NON_ALPHANUMERIC};
@@ -42,6 +47,10 @@ pub struct AnnounceRequest {
     pub event: Option<Event>,
     /// Сколько пиров просить; `None` — параметр не отправляется.
     pub numwant: Option<u32>,
+    /// Случайный ключ сессии (HTTP-параметр `key` / 4 байта UDP): помогает
+    /// трекеру различать сессии клиентов за общим NAT. Генерируется раз
+    /// на сессию — [`session_key`].
+    pub key: u32,
 }
 
 /// Событие жизненного цикла сессии (BEP 3).
@@ -98,6 +107,49 @@ pub enum TrackerError {
     /// Трекер сообщил об отказе в поле `failure reason`.
     #[error("tracker failure: {0}")]
     TrackerFailure(String),
+    /// Ошибка UDP-транспорта или DNS-резолва.
+    #[error("udp error: {0}")]
+    Udp(#[from] std::io::Error),
+    /// UDP-трекер не ответил за 8 попыток с удваивающимся таймаутом.
+    #[error("udp tracker did not respond after 8 attempts")]
+    Timeout,
+    /// Схема announce-URL не поддерживается (не http/https/udp).
+    #[error("unsupported tracker scheme: {0}")]
+    UnsupportedScheme(String),
+}
+
+/// Выполняет announce, выбирая транспорт по схеме URL: `udp://` — BEP 15
+/// (DNS-резолв раз за анонс, предпочитаем IPv4; путь игнорируется),
+/// `http(s)://` — [`announce_http`].
+///
+/// # Errors
+///
+/// [`TrackerError::UnsupportedScheme`] для прочих схем; остальные — как у
+/// выбранного транспорта.
+pub async fn announce(
+    tracker_url: &str,
+    req: &AnnounceRequest,
+) -> Result<AnnounceResponse, TrackerError> {
+    let url = Url::parse(tracker_url)?;
+    match url.scheme() {
+        "http" | "https" => announce_http(tracker_url, req).await,
+        "udp" => {
+            let host = url
+                .host_str()
+                .ok_or(TrackerError::InvalidField("udp host"))?;
+            let port = url.port().ok_or(TrackerError::InvalidField("udp port"))?;
+            let resolved = tokio::net::lookup_host((host, port)).await?;
+            let resolved: Vec<SocketAddr> = resolved.collect();
+            let addr = resolved
+                .iter()
+                .copied()
+                .find(SocketAddr::is_ipv4)
+                .or_else(|| resolved.first().copied())
+                .ok_or(TrackerError::InvalidField("udp host"))?;
+            announce_udp(addr, req).await
+        }
+        other => Err(TrackerError::UnsupportedScheme(other.to_string())),
+    }
 }
 
 /// Выполняет HTTP-announce к трекеру.
@@ -143,6 +195,7 @@ fn build_query_url(tracker_url: &str, req: &AnnounceRequest) -> Result<Url, Trac
         ("downloaded", req.downloaded.to_string()),
         ("left", req.left.to_string()),
         ("compact", "1".to_string()),
+        ("key", req.key.to_string()),
     ] {
         query.push_str(name);
         query.push('=');
@@ -190,7 +243,7 @@ fn parse_response(body: &[u8]) -> Result<AnnounceResponse, TrackerError> {
 }
 
 /// Компактный формат: каждые 6 байт — IPv4 big-endian + порт big-endian.
-fn parse_compact_peers(raw: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
+pub(crate) fn parse_compact_peers(raw: &[u8]) -> Result<Vec<SocketAddr>, TrackerError> {
     if !raw.len().is_multiple_of(6) {
         return Err(TrackerError::InvalidPeers(raw.len()));
     }
@@ -242,6 +295,12 @@ pub fn peer_id() -> [u8; 20] {
         *byte = ALPHANUMERIC[fastrand::usize(..ALPHANUMERIC.len())];
     }
     id
+}
+
+/// Генерирует случайный ключ сессии для [`AnnounceRequest::key`] — раз на
+/// сессию, рядом с [`peer_id`].
+pub fn session_key() -> u32 {
+    fastrand::u32(..)
 }
 
 #[cfg(test)]

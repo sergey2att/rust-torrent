@@ -10,6 +10,7 @@ reqwest.workspace = true
 percent-encoding.workspace = true
 url.workspace = true
 fastrand.workspace = true
+tokio = { workspace = true, features = ["net", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread"] }

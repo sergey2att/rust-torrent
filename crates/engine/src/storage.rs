@@ -121,14 +121,45 @@ impl DiskStorage {
         Ok(())
     }
 
-    /// Читает кусок целиком (нужно для отдачи данных другим пирам, этап 4).
-    /// Последний кусок короче `piece_length`.
+    /// Читает кусок целиком (recheck при старте сидирования). Последний
+    /// кусок короче `piece_length`.
     pub fn read_piece(&self, piece_index: u32) -> std::io::Result<Vec<u8>> {
         let start = u64::from(piece_index) * self.piece_length;
         let len = self
             .total_length
             .saturating_sub(start)
             .min(self.piece_length);
+        self.read_range(start, len)
+    }
+
+    /// Читает блок внутри куска — для отдачи данных другим пирам.
+    ///
+    /// Нулевая длина или диапазон вне куска — ошибка ввода-вывода: у вызываю-
+    /// щего (хаба) такие request'ы уже отсечены, здесь страховка для прямого
+    /// использования.
+    pub fn read_block(
+        &self,
+        piece_index: u32,
+        begin: u32,
+        length: u32,
+    ) -> std::io::Result<Vec<u8>> {
+        let piece_start = u64::from(piece_index) * self.piece_length;
+        let piece_len = self
+            .total_length
+            .saturating_sub(piece_start)
+            .min(self.piece_length);
+        if length == 0 || u64::from(begin) + u64::from(length) > piece_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("block [{begin}, +{length}) out of piece {piece_index}"),
+            ));
+        }
+        self.read_range(piece_start + u64::from(begin), u64::from(length))
+    }
+
+    /// Читает диапазон глобального байтового пространства, разбивая по файлам
+    /// (чтение может пересекать границу двух файлов).
+    fn read_range(&self, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
         let mut out = vec![0u8; usize::try_from(len).unwrap_or(0)];
         for slice in &self.files {
             let slice_end = slice.offset + slice.length;

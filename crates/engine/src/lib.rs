@@ -1,23 +1,28 @@
-//! Engine: менеджер кусков, дисковый слой и оркестрация многопирового
-//! скачивания (этап 3).
+//! Engine: менеджер кусков, дисковый слой и оркестрация многопировой
+//! сессии — скачивание и раздача (этапы 3–4).
 //!
-//! Архитектура — актор на mpsc (см. `GRILL-ME-stage3.md`):
+//! Архитектура — актор на mpsc (см. `GRILL-ME-stage3.md`, `GRILL-ME-stage4.md`):
 //! - хаб владеет [`PieceManager`] и раздаёт блоки пирам;
-//! - peer-задачи (по одной на соединение) шлют события вверх по каналу;
+//! - peer-задачи (по одной на соединение, исходящие и входящие) шлют события
+//!   вверх по каналу;
 //! - отдельная задача-писатель владеет [`DiskStorage`], порядок записей
-//!   бесплатен благодаря FIFO-каналу.
+//!   бесплатен благодаря FIFO-каналу; через неё же идут чтения для отдачи;
+//! - анонс-актор не блокирует сессию трекером (HTTP или UDP — по схеме URL);
+//! - [`ChokeManager`] решает, кому отдавать (round-robin + optimistic-слот).
 //!
-//! Отклонения от исходного контракта ТЗ зафиксированы в прожарке этапа:
+//! Отклонения от исходного контракта ТЗ зафиксированы в прожарках этапов:
 //! `PeerHandle = SocketAddr`; `next_block_request` принимает `peer_id` и ведёт
 //! in-flight по пирам; `DiskStorage::write_piece` пишет кусок целиком после
 //! in-memory verify; `download_block` из peer-wire удалён; endgame в объёме.
 
+mod choke;
 mod piece_manager;
 mod session;
 mod storage;
 
+pub use choke::{ChokeDecision, ChokeManager};
 pub use piece_manager::{BlockRequest, PeerHandle, PieceEvent, PieceManager};
-pub use session::{download, download_with_peers, Progress};
+pub use session::{download, download_with_peers, session, Progress};
 pub use storage::DiskStorage;
 
 /// Максимальное число одновременных соединений с пирами.

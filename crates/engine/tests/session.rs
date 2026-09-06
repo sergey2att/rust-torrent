@@ -145,14 +145,16 @@ async fn serve(
     }
 }
 
-/// Синтетический однофайловый торрент: кусок `i` заполнен байтом `i as u8`.
+/// Синтетический однофайловый торрент: кусок `i` заполнен байтом `(i + 1)`.
+/// Не нулевой даже для куска 0 — иначе recheck «скачает» его из sparse-нулевой
+/// преаллокации и тесты скачивания потеряют смысл.
 fn test_torrent(piece_length: u64, total: u64) -> (metainfo::TorrentFile, Vec<Vec<u8>>) {
     let count = usize::try_from(total.div_ceil(piece_length)).unwrap();
     let mut pieces = Vec::with_capacity(count);
     let mut hashes = Vec::with_capacity(count);
     for i in 0..count {
         let len = (total - i as u64 * piece_length).min(piece_length);
-        let data = vec![i as u8; usize::try_from(len).unwrap()];
+        let data = vec![(i + 1) as u8; usize::try_from(len).unwrap()];
         hashes.push(Sha1::digest(&data).into());
         pieces.push(data);
     }
@@ -311,3 +313,123 @@ async fn message_flood_while_requesting_does_not_desync() {
 }
 
 // ponytail: IdleTimeout (10 минут) в юнит-тестах не проверяется
+
+// --- Seeding (этап 4): отдача данных другим пирам ---
+
+/// Полный цикл «сидер → личер»: сидер запускает `session()` на готовых данных
+/// (recheck при старте), личер качает `download_with_peers` по loopback.
+#[tokio::test]
+async fn seeder_serves_full_torrent_to_leecher() {
+    let (torrent, pieces) = test_torrent(1024, 3 * 1024 + 7);
+    let expected: Vec<u8> = pieces.iter().flatten().copied().collect();
+
+    // Данные сидера уже на диске.
+    let seed_dir = tempfile::tempdir().unwrap();
+    std::fs::write(seed_dir.path().join("test-dl"), &expected).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let (seed_progress_tx, mut seed_progress_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = mpsc::channel(1);
+    let seed_path = seed_dir.path().to_path_buf();
+    let seeder_torrent = torrent.clone();
+    let seeder = tokio::spawn(async move {
+        engine::session(
+            seeder_torrent,
+            &seed_path,
+            listener,
+            Some(seed_progress_tx),
+            stop_rx,
+        )
+        .await
+    });
+
+    // Личер знает только адрес сидера.
+    let leech_dir = tempfile::tempdir().unwrap();
+    let files = tokio::time::timeout(
+        Duration::from_secs(30),
+        download_with_peers(torrent, leech_dir.path(), vec![seeder_addr], None),
+    )
+    .await
+    .expect("скачивание у сидера зависло")
+    .expect("скачивание у сидера не удалось");
+    let content = std::fs::read(&files[0]).unwrap();
+    assert_eq!(
+        content, expected,
+        "личер обязан скачать у сидера ровно исходные данные"
+    );
+
+    // Останавливаем сидера и проверяем, что отдавал он, а не молчал.
+    stop_tx.send(()).await.unwrap();
+    let _ = seeder.await;
+    let mut uploaded = 0u64;
+    while let Ok(p) = seed_progress_rx.try_recv() {
+        uploaded = uploaded.max(p.uploaded_bytes);
+    }
+    assert_eq!(
+        uploaded,
+        expected.len() as u64,
+        "сидер должен был отдать весь торрент"
+    );
+}
+
+/// Request с мусорным диапазоном (длина 0 / выход за кусок) — недоверенный
+/// ввод: сидер разрывает соединение, а не отдаёт мусор.
+#[tokio::test]
+async fn seeder_closes_connection_on_garbage_request() {
+    let (torrent, pieces) = test_torrent(1024, 1024);
+    let seed_dir = tempfile::tempdir().unwrap();
+    let expected: Vec<u8> = pieces.iter().flatten().copied().collect();
+    std::fs::write(seed_dir.path().join("test-dl"), &expected).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let (_stop_tx, stop_rx) = mpsc::channel(1);
+    let seed_path = seed_dir.path().to_path_buf();
+    let _seeder =
+        tokio::spawn(
+            async move { engine::session(torrent, &seed_path, listener, None, stop_rx).await },
+        );
+
+    // Фейковый личер: handshake → interested → мусорный request.
+    let mut conn = TcpStream::connect(seeder_addr).await.unwrap();
+    let mut hs = Vec::with_capacity(HANDSHAKE_LEN);
+    hs.push(19);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&INFO_HASH);
+    hs.extend_from_slice(&[5u8; 20]);
+    conn.write_all(&hs).await.unwrap();
+    conn.flush().await.unwrap();
+    let mut reply = [0u8; HANDSHAKE_LEN];
+    conn.read_exact(&mut reply).await.unwrap();
+
+    write_message(&mut conn, &PeerMessage::Interested)
+        .await
+        .unwrap();
+    // Длина 0 — мусор: ждём закрытия соединения (EOF при чтении).
+    write_message(
+        &mut conn,
+        &PeerMessage::Request {
+            index: 0,
+            begin: 0,
+            length: 0,
+        },
+    )
+    .await
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            // EOF/ошибка = соединение закрыто; bitfield/unchoke до закрытия —
+            // читаем дальше.
+            if read_message(&mut conn).await.is_err() {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        result.is_ok(),
+        "сидер обязан разорвать соединение за мусорный request"
+    );
+}

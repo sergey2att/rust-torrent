@@ -63,6 +63,7 @@ fn sample_request(info_hash: [u8; 20]) -> AnnounceRequest {
         left: 1000,
         event: Some(Event::Started),
         numwant: None,
+        key: 0x1234_5678,
     }
 }
 
@@ -292,6 +293,7 @@ async fn query_encodes_raw_bytes_preserves_params_and_sends_fields() {
     assert!(query.contains("peer_id=-RT1000-"));
     // Остальные поля запроса.
     assert!(query.contains("port=6881"));
+    assert!(query.contains("key=305419896"));
     assert!(query.contains("uploaded=0"));
     assert!(query.contains("downloaded=0"));
     assert!(query.contains("left=1000"));

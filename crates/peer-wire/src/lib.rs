@@ -140,45 +140,77 @@ pub async fn perform_handshake(
     expected_info_hash: [u8; 20],
 ) -> Result<Handshake, PeerWireError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let mut out = Vec::with_capacity(HANDSHAKE_LEN);
-        out.push(
-            u8::try_from(PROTOCOL_STRING.len())
-                .map_err(|_| PeerWireError::InvalidField("protocol string length"))?,
-        );
-        out.extend_from_slice(PROTOCOL_STRING);
-        out.extend_from_slice(&ours.reserved);
-        out.extend_from_slice(&ours.info_hash);
-        out.extend_from_slice(&ours.peer_id);
+        let out = encode_handshake(ours)?;
         stream.write_all(&out).await?;
         stream.flush().await?;
-
-        let mut reply = [0u8; HANDSHAKE_LEN];
-        stream.read_exact(&mut reply).await?;
-        if reply[0] as usize != PROTOCOL_STRING.len() {
-            return Err(PeerWireError::InvalidProtocolLength(reply[0]));
-        }
-        if &reply[1..20] != PROTOCOL_STRING {
-            return Err(PeerWireError::InvalidProtocolString);
-        }
-        let mut reserved = [0u8; 8];
-        reserved.copy_from_slice(&reply[20..28]);
-        let mut info_hash = [0u8; 20];
-        info_hash.copy_from_slice(&reply[28..48]);
-        let mut peer_id = [0u8; 20];
-        peer_id.copy_from_slice(&reply[48..68]);
-        if info_hash != expected_info_hash {
-            return Err(PeerWireError::InfoHashMismatch {
-                expected: expected_info_hash,
-                got: info_hash,
-            });
-        }
-        Ok(Handshake {
-            reserved,
-            info_hash,
-            peer_id,
-        })
+        read_validate_handshake(stream, expected_info_hash).await
     })
     .await?
+}
+
+/// Обрабатывает входящий handshake: пир, инициировавший соединение, присылает
+/// свой handshake первым — читаем, валидируем теми же проверками, что в
+/// [`perform_handshake`], и отвечаем нашим. Возвращает handshake пира.
+pub async fn accept_handshake(
+    stream: &mut TcpStream,
+    ours: &Handshake,
+    expected_info_hash: [u8; 20],
+) -> Result<Handshake, PeerWireError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let theirs = read_validate_handshake(stream, expected_info_hash).await?;
+        let out = encode_handshake(ours)?;
+        stream.write_all(&out).await?;
+        stream.flush().await?;
+        Ok(theirs)
+    })
+    .await?
+}
+
+/// Кодирует наш handshake (68 байт).
+fn encode_handshake(ours: &Handshake) -> Result<Vec<u8>, PeerWireError> {
+    let mut out = Vec::with_capacity(HANDSHAKE_LEN);
+    out.push(
+        u8::try_from(PROTOCOL_STRING.len())
+            .map_err(|_| PeerWireError::InvalidField("protocol string length"))?,
+    );
+    out.extend_from_slice(PROTOCOL_STRING);
+    out.extend_from_slice(&ours.reserved);
+    out.extend_from_slice(&ours.info_hash);
+    out.extend_from_slice(&ours.peer_id);
+    Ok(out)
+}
+
+/// Читает 68 байт handshake пира и валидирует: длина строки протокола, строка,
+/// `info_hash` (чужой сворм бесполезен). `reserved`/`peer_id` не проверяются.
+async fn read_validate_handshake(
+    stream: &mut (impl AsyncRead + Unpin),
+    expected_info_hash: [u8; 20],
+) -> Result<Handshake, PeerWireError> {
+    let mut reply = [0u8; HANDSHAKE_LEN];
+    stream.read_exact(&mut reply).await?;
+    if reply[0] as usize != PROTOCOL_STRING.len() {
+        return Err(PeerWireError::InvalidProtocolLength(reply[0]));
+    }
+    if &reply[1..20] != PROTOCOL_STRING {
+        return Err(PeerWireError::InvalidProtocolString);
+    }
+    let mut reserved = [0u8; 8];
+    reserved.copy_from_slice(&reply[20..28]);
+    let mut info_hash = [0u8; 20];
+    info_hash.copy_from_slice(&reply[28..48]);
+    let mut peer_id = [0u8; 20];
+    peer_id.copy_from_slice(&reply[48..68]);
+    if info_hash != expected_info_hash {
+        return Err(PeerWireError::InfoHashMismatch {
+            expected: expected_info_hash,
+            got: info_hash,
+        });
+    }
+    Ok(Handshake {
+        reserved,
+        info_hash,
+        peer_id,
+    })
 }
 
 /// Читает одно сообщение пира.
@@ -390,6 +422,11 @@ impl Bitfield {
     /// Число кусков, на которое рассчитана карта.
     pub fn piece_count(&self) -> usize {
         self.piece_count
+    }
+
+    /// Сырые байты карты для отправки по проводу.
+    pub fn wire_bytes(&self) -> Vec<u8> {
+        self.bytes.clone()
     }
 }
 

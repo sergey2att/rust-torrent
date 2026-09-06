@@ -188,3 +188,56 @@ fn valid_nested_paths_are_accepted() {
     assert_eq!(storage.file_paths().len(), 1);
     assert!(Path::new(&storage.file_paths()[0]).exists());
 }
+
+// --- read_block (отдача данных другим пирам, этап 4) ---
+
+#[test]
+fn read_block_returns_bytes_at_offset() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = info_single("rb", 128, 3 * 128);
+    let mut storage = DiskStorage::new(&info, dir.path()).unwrap();
+    // Кусок i заполнен байтом i.
+    for i in 0..3u32 {
+        let piece = [i as u8; 128];
+        storage.write_piece(i, &piece).unwrap();
+    }
+    assert_eq!(storage.read_block(0, 0, 16).unwrap(), vec![0u8; 16]);
+    assert_eq!(storage.read_block(1, 100, 28).unwrap(), vec![1u8; 28]);
+    // Последний блок куска упирается в его конец.
+    assert_eq!(storage.read_block(2, 112, 16).unwrap(), vec![2u8; 16]);
+}
+
+#[test]
+fn read_block_crosses_file_boundary() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = info_multi("rb-multi", &[(vec!["a.bin"], 100), (vec!["b.bin"], 60)]);
+    let mut storage = DiskStorage::new(&info, dir.path()).unwrap();
+    let total = 160;
+    let data: Vec<u8> = (0u8..).take(total).collect();
+    storage.write_piece(0, &data[..64]).unwrap();
+    storage.write_piece(1, &data[64..128]).unwrap();
+    storage.write_piece(2, &data[128..]).unwrap();
+    // Диапазон 90..110 лежит в двух файлах.
+    assert_eq!(
+        storage.read_block(1, 26, 20).unwrap(),
+        data[90..110].to_vec()
+    );
+}
+
+#[test]
+fn read_block_rejects_empty_and_out_of_piece_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let info = info_single("rb-bad", 128, 2 * 128);
+    let storage = DiskStorage::new(&info, dir.path()).unwrap();
+    // Нулевая длина.
+    let err = storage.read_block(0, 0, 0).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    // begin + length больше куска.
+    let err = storage.read_block(0, 100, 29).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    // Кусок за пределами торрента.
+    let err = storage.read_block(5, 0, 1).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    // begin + length ровно по границе куска — валидно (нечитаемые sparse-нули).
+    assert_eq!(storage.read_block(0, 112, 16).unwrap(), vec![0u8; 16]);
+}

@@ -258,6 +258,16 @@ impl PieceManager {
         self.done_count == self.pieces.len()
     }
 
+    /// Отмечает кусок проверенным без приёма блоков — recheck готовых данных
+    /// при старте сидирования. Вне диапазона или повторно — no-op.
+    pub fn mark_verified(&mut self, piece_index: u32) {
+        let i = piece_index as usize;
+        if i < self.states.len() && !matches!(self.states[i], PieceState::Done) {
+            self.states[i] = PieceState::Done;
+            self.done_count += 1;
+        }
+    }
+
     /// Сколько кусков скачано и проверено.
     pub fn completed_pieces(&self) -> usize {
         self.done_count

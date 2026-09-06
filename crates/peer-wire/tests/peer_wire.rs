@@ -351,3 +351,50 @@ async fn elapsed_maps_to_peer_wire_timeout() {
     let mapped: PeerWireError = elapsed.into();
     assert!(matches!(mapped, PeerWireError::Timeout(_)));
 }
+
+// --- accept_handshake (входящие соединения, этап 4) ---
+
+#[tokio::test]
+async fn accept_handshake_validates_then_replies_with_ours() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let theirs = peer_wire::accept_handshake(&mut conn, &ours(), INFO_HASH)
+            .await
+            .unwrap();
+        assert_eq!(theirs.peer_id, PEER_ID);
+        assert_eq!(theirs.info_hash, INFO_HASH);
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    // Клиент инициирует: шлёт первым и читает ответ сервера.
+    let returned = perform_handshake(&mut client, &ours(), INFO_HASH)
+        .await
+        .unwrap();
+    assert_eq!(returned.peer_id, PEER_ID);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn accept_handshake_rejects_foreign_info_hash() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let err = peer_wire::accept_handshake(&mut conn, &ours(), INFO_HASH).await;
+        assert!(
+            matches!(err, Err(PeerWireError::InfoHashMismatch { .. })),
+            "получено: {err:?}"
+        );
+    });
+
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    let mut foreign = ours();
+    foreign.info_hash = [9u8; 20];
+    // Сервер закроет соединение после чужого info_hash — клиент увидит обрыв.
+    assert!(perform_handshake(&mut client, &foreign, foreign.info_hash)
+        .await
+        .is_err());
+    server.await.unwrap();
+}
