@@ -1,0 +1,21 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+metainfo = { path = "../metainfo" }
+tracker = { path = "../tracker" }
+peer-wire = { path = "../peer-wire" }
+thiserror.workspace = true
+sha1.workspace = true
+fastrand.workspace = true
+tracing = "0.1"
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

@@ -6,13 +6,17 @@ edition.workspace = true
 [dependencies]
 metainfo = { path = "../metainfo" }
 tracker = { path = "../tracker" }
-peer-wire = { path = "../peer-wire" }
+engine = { path = "../engine" }
 anyhow = "1"
-sha1.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tracing-subscriber = "0.3"
 
 [dev-dependencies]
+peer-wire = { path = "../peer-wire" }
 hex.workspace = true
+sha2 = "0.10"
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
 
 [lints]
 workspace = true

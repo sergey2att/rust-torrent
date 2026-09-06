@@ -16,9 +16,6 @@ const PROTOCOL_STRING: &[u8] = b"BitTorrent protocol";
 /// Таймаут всего handshake (на операцию, не на каждый read).
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Таймаут скачивания одного блока (на операцию).
-pub const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Максимальная длина сообщения (ID + payload). Реальные сообщения много
 /// меньше: блоки по конвенции не больше `MAX_BLOCK_LEN`, bitfield — сотни байт; один
 /// мебибайт — потолок с запасом, защищающий от `DoS` гигантским префиксом длины.
@@ -122,20 +119,9 @@ pub enum PeerWireError {
     /// ID сообщения не входит в известный набор BEP 3.
     #[error("unknown message id: {0}")]
     UnknownMessage(u8),
-    /// `length` блока в `download_block`: ноль или больше [`MAX_BLOCK_LEN`].
-    #[error("invalid block length: {0} (must be 1..={})", MAX_BLOCK_LEN)]
-    InvalidBlockLength(u32),
     /// Payload сообщения неожиданной длины или не того вида.
     #[error("invalid message field: {0}")]
     InvalidField(&'static str),
-    /// Пришёл piece с begin, не совпавшим с запрошенным.
-    #[error("piece begin mismatch: expected {expected}, got {got}")]
-    InvalidPieceBegin {
-        /// Запрошенное смещение.
-        expected: u32,
-        /// Фактическое смещение в ответе.
-        got: u32,
-    },
     /// Операция превысила таймаут.
     #[error("operation timed out")]
     Timeout(#[from] tokio::time::error::Elapsed),
@@ -348,59 +334,63 @@ pub async fn write_message(
     Ok(())
 }
 
-/// Скачивает один блок: interested → дождаться unchoke → request → piece.
+/// Битовая карта кусков пира (сообщение ID 5).
 ///
-/// Пока ждём unchoke/piece, сообщения KeepAlive/Have/Bitfield/Port и чужие
-/// Piece пропускаются; повторный Choke возвращает нас в режим ожидания unchoke.
-/// ponytail: временный хелпер этапа 2, на этапе 3 заменяется стейт-машиной в engine.
-pub async fn download_block(
-    stream: &mut TcpStream,
-    index: u32,
-    begin: u32,
-    length: u32,
-) -> Result<Vec<u8>, PeerWireError> {
-    if length == 0 || length > MAX_BLOCK_LEN {
-        return Err(PeerWireError::InvalidBlockLength(length));
-    }
-    tokio::time::timeout(DOWNLOAD_TIMEOUT, async {
-        write_message(stream, &PeerMessage::Interested).await?;
-        let mut unchoked = false;
-        let mut requested = false;
-        loop {
-            match read_message(stream).await? {
-                PeerMessage::Unchoke => unchoked = true,
-                PeerMessage::Choke => unchoked = false,
-                PeerMessage::Piece {
-                    index: piece_index,
-                    begin: piece_begin,
-                    block,
-                } if piece_index == index => {
-                    if piece_begin != begin {
-                        return Err(PeerWireError::InvalidPieceBegin {
-                            expected: begin,
-                            got: piece_begin,
-                        });
-                    }
-                    return Ok(block);
-                }
-                // Piece чужого куска, а также KeepAlive/Have/Bitfield/Port — пропускаем.
-                _ => {}
-            }
-            if unchoked && !requested {
-                write_message(
-                    stream,
-                    &PeerMessage::Request {
-                        index,
-                        begin,
-                        length,
-                    },
-                )
-                .await?;
-                requested = true;
-            }
+/// Биты идут от старшего к младшему внутри каждого байта: бит 0 — кусок 0.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bitfield {
+    bytes: Vec<u8>,
+    piece_count: usize,
+}
+
+impl Bitfield {
+    /// Разбирает bitfield с провода: длина обязана быть ровно
+    /// `ceil(piece_count / 8)`, хвостовые биты последнего байта — нулями
+    /// (ненулевой хвост — нарушение протокола, пиру нельзя доверять).
+    pub fn from_wire(bytes: Vec<u8>, piece_count: usize) -> Result<Self, PeerWireError> {
+        let expected_len = piece_count.div_ceil(8);
+        if bytes.len() != expected_len {
+            return Err(PeerWireError::InvalidField("bitfield length"));
         }
-    })
-    .await?
+        let spare_bits = expected_len * 8 - piece_count;
+        if spare_bits > 0 && bytes[expected_len - 1] & ((1u8 << spare_bits) - 1) != 0 {
+            return Err(PeerWireError::InvalidField("bitfield padding bits"));
+        }
+        Ok(Self { bytes, piece_count })
+    }
+
+    /// Пустая карта (пир не прислал bitfield или в сворме 0 кусков).
+    pub fn new_empty(piece_count: usize) -> Self {
+        Self {
+            bytes: vec![0u8; piece_count.div_ceil(8)],
+            piece_count,
+        }
+    }
+
+    /// Есть ли у пира кусок `index` (вне диапазона — `false`).
+    pub fn has(&self, index: u32) -> bool {
+        let i = index as usize;
+        i < self.piece_count && self.bytes[i / 8] & (0x80 >> (i % 8)) != 0
+    }
+
+    /// Отмечает кусок как имеющийся (для `Have` поверх пустой карты);
+    /// индекс вне диапазона игнорируется.
+    pub fn set(&mut self, index: u32) {
+        let i = index as usize;
+        if i < self.piece_count {
+            self.bytes[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+
+    /// `true`, если ни один бит не установлен.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.iter().all(|&b| b == 0)
+    }
+
+    /// Число кусков, на которое рассчитана карта.
+    pub fn piece_count(&self) -> usize {
+        self.piece_count
+    }
 }
 
 fn parse_triple(payload: &[u8]) -> Result<(u32, u32, u32), PeerWireError> {

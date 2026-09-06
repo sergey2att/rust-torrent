@@ -19,8 +19,8 @@ crates/
 ├── metainfo/      # разбор .torrent, info-hash (этап 1) ✅
 ├── tracker/       # HTTP-announce (этап 2) ✅, UDP-announce (этап 4)
 ├── peer-wire/     # handshake + фрейминг сообщений пиров (этап 2) ✅, этап 6 — расширения
-├── cli/           # бинарник для сквозной проверки этапов ✅ (этап 2: announce → кусок 0 → SHA-1)
-├── engine/        # менеджер кусков, дисковый слой, оркестрация (3, 4)  — ещё не создан
+├── cli/           # бинарник для сквозной проверки этапов ✅ (этап 3: полное скачивание)
+├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce — этап 4
 ├── dht/           # Kademlia DHT (этап 5)                               — ещё не создан
 ├── ext-metadata/  # extension protocol + ut_metadata (этап 5)           — ещё не создан
 ├── ext-pex/       # ut_pex (этап 6)                                     — ещё не создан
@@ -58,7 +58,8 @@ crates/
 ```bash
 cargo test                              # все тесты (офлайн, сетевых нет)
 cargo test -p metainfo                  # один крейт
-cargo run -p cli -- <file.torrent>      # announce → первый живой пир → кусок 0 → SHA-1
+cargo run --release -p cli -- <file.torrent> <download_dir>   # полный цикл скачивания через engine (этап 3+)
+RUST_LOG=engine=debug cargo run --release -p cli -- ...      # трассировка движка (по умолчанию — только ERROR)
 cargo test -p cli -- --ignored --nocapture   # ручной smoke: реальный трекер + живой пир
 cargo clippy --all-targets -- -D warnings   # must be clean (0 warnings)
 cargo fmt                               # форматирование перед коммитом
@@ -117,12 +118,26 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - Тесты имеют право на `unwrap` (паника теста = провал), библиотека нет
 - Эталон структуры тестов на этот проект: `crates/bencode/tests/codec.rs` — таблица форматов, граничные значения, все варианты ошибок, каноническая форма, DoS-кейсы
 - Этап 2: mock-HTTP-трекер на голом `TcpListener` (`crates/tracker/tests/announce.rs`, включая контракт «info_hash — сырые байты, не hex»), handshake/фрейминг/фейковый пир с SHA-1 (`crates/peer-wire/tests/peer_wire.rs`), `#[ignore]`-smoke (`crates/cli/tests/smoke.rs`)
+- Этап 3: PieceManager (`crates/engine/tests/piece_manager.rs`), DiskStorage (`crates/engine/tests/storage.rs`), интеграционные с фейковыми пирами (`crates/engine/tests/session.rs` — включая стресс-регрессию на отмену чтения `message_flood_while_requesting_does_not_desync`), приёмочная фикстура `crates/cli/tests/fixtures/debian-13.6.0-amd64-netinst.iso.torrent`
+
+## Решения этапа 3 (не менять без обсуждения)
+
+Полный разбор — в `GRILL-ME-stage3.md`. Ключевое:
+
+- **Архитектура**: актор на mpsc — хаб владеет `PieceManager`, peer-задачи и диск-таск общаются каналами; диск — отдельная задача-писатель (FIFO-канал: порядок WritePiece бесплатен, verify in-memory до диска).
+- **Чтение пиров — отдельная задача-читатель, владеющая read-half сокета**. Чтения никогда не отменяются на полпути: гонка `select!` с командным каналом теряла недочитанные байты и рассинхронизировала поток (все пиры умирали на «message too large»). Главное правило: в `select!` гоняются только cancel-safe `recv()` каналов.
+- **Неизвестные message ID пропускаются** (BEP 10, id 20 шлют все современные клиенты) — отклонение от «ревизии на этапах 5–6», вызванное реальным свормом.
+- **Pipeline**: 5 request на соединение, рефилл после КАЖДОГО принятого блока (не только после завершения куска — иначе стагнация).
+- **Блоки/куски**: rarest-first со случайным тай-брейком, частичные куски приоритетнее, блоки ≤16 КиБ; endgame — дубликат при пустом пуле, Cancel остальным.
+- **Re-announce**: `clamp(tracker_interval, 30 с, 5 мин)` — отклонение от `max(interval, 30 с)`: трекеры дают interval 1800 с > idle-таймаута 10 мин, сессия умирала раньше следующего анонса.
+- **Соединения**: лимит 50, дедуп адресов без ре-коннекта, connect+handshake 10 с, read-таймаут 120 с; ошибки peer-задачи — тихое выбытие.
+- **Диск**: pre-allocation `set_len` (sparse), санитизация путей с полным отказом (`UnsafePath`), `u64` размеры.
 
 ## План этапов
 
 1. ✅ Bencode и структура .torrent
 2. ✅ HTTP-announce + peer handshake (сквозной цикл проверен на живом торренте Debian 13.6)
-3. Менеджер кусков, дисковый слой, пайплайн скачивания
+3. ✅ Менеджер кусков, дисковый слой, пайплайн скачивания (приёмка: Debian 13.6 netinst 755 МБ, SHA-256 совпал с официальным)
 4. UDP-трекеры + NAT через порт (engine)
 5. DHT, magnet-ссылки, extension protocol + ut_metadata
 6. ut_pex, UPnP/NAT-PMP, полировка peer-wire

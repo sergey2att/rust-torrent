@@ -4,10 +4,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use peer_wire::{
-    download_block, perform_handshake, read_message, write_message, Handshake, PeerMessage,
+    perform_handshake, read_message, write_message, Bitfield, Handshake, PeerMessage,
     PeerWireError, HANDSHAKE_LEN,
 };
-use sha1::{Digest, Sha1};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -48,27 +47,6 @@ async fn handshake_server(reply: Vec<u8>) -> (TcpStream, JoinHandle<()>) {
         conn.flush().await.unwrap();
     })
     .await
-}
-
-/// Читает один фрейм сообщения с сокета: префикс длины, ID, payload.
-async fn read_frame(conn: &mut TcpStream) -> (u8, Vec<u8>) {
-    let mut prefix = [0u8; 4];
-    conn.read_exact(&mut prefix).await.unwrap();
-    let len = u32::from_be_bytes(prefix) as usize;
-    assert!(len >= 1, "keep-alive в этой роли теста не ожидается");
-    let mut msg = vec![0u8; len];
-    conn.read_exact(&mut msg).await.unwrap();
-    (msg[0], msg[1..].to_vec())
-}
-
-/// Читает фреймы до первого request (клиент шлёт Interested и другие раньше).
-async fn read_request(conn: &mut TcpStream) -> Vec<u8> {
-    loop {
-        let (id, payload) = read_frame(conn).await;
-        if id == 6 {
-            return payload;
-        }
-    }
 }
 
 fn valid_reply() -> Vec<u8> {
@@ -293,150 +271,76 @@ async fn truncated_message_payload_is_io_error() {
     assert!(matches!(err, PeerWireError::Io(_)));
 }
 
-// --- Фейковый пир (приёмочный кейс этапа) ---
+// --- Bitfield ---
 
-#[tokio::test]
-async fn fake_peer_handshake_unchoke_piece_sha1_matches() {
-    let block = *b"known block data!";
-    let expected_sha1: [u8; 20] = Sha1::digest(block).into();
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut conn, _) = listener.accept().await.unwrap();
-        // Читаем handshake клиента и отвечаем валидным.
-        let mut buf = vec![0u8; HANDSHAKE_LEN];
-        conn.read_exact(&mut buf).await.unwrap();
-        conn.write_all(&valid_reply()).await.unwrap();
-        conn.flush().await.unwrap();
-        // Unchoke (длина 1 покрывает только ID).
-        conn.write_all(&1u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&[1u8]).await.unwrap();
-        // Ждём request (пропуская Interested), отвечаем piece.
-        let _request = read_request(&mut conn).await;
-        let total = u32::try_from(1 + 8 + block.len()).unwrap();
-        conn.write_all(&total.to_be_bytes()).await.unwrap();
-        conn.write_all(&[7u8]).await.unwrap();
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap(); // index
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap(); // begin
-        conn.write_all(&block).await.unwrap();
-        conn.flush().await.unwrap();
-    });
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    perform_handshake(&mut client, &ours(), INFO_HASH)
-        .await
-        .unwrap();
-    let got = download_block(&mut client, 0, 0, u32::try_from(block.len()).unwrap())
-        .await
-        .unwrap();
-
-    server.await.unwrap();
-    assert_eq!(got, block);
-    assert_eq!(Sha1::digest(&got).as_slice(), expected_sha1);
+#[test]
+fn bitfield_from_wire_accepts_valid_map() {
+    // 10 кусков = 2 байта, установлены куски 0 и 9.
+    let bf = Bitfield::from_wire(vec![0b1000_0000, 0b0100_0000], 10).unwrap();
+    assert!(bf.has(0));
+    assert!(bf.has(9));
+    assert!(!bf.has(1));
+    assert!(!bf.has(8));
+    assert!(!bf.is_empty());
+    assert_eq!(bf.piece_count(), 10);
 }
 
-#[tokio::test]
-async fn download_block_skips_chatter_before_piece() {
-    // Пир сперва шлёт keep-alive, have, bitfield, второй unchoke, и только
-    // потом piece — хелпер должен всё это пропустить.
-    let block = b"payload!";
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut conn, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; HANDSHAKE_LEN];
-        conn.read_exact(&mut buf).await.unwrap();
-        conn.write_all(&valid_reply()).await.unwrap();
-        // keep-alive
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap();
-        // have {2}
-        conn.write_all(&5u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&[4u8]).await.unwrap();
-        conn.write_all(&2u32.to_be_bytes()).await.unwrap();
-        // unchoke
-        conn.write_all(&1u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&[1u8]).await.unwrap();
-        // Ждём request (пропуская Interested).
-        let _request = read_request(&mut conn).await;
-        // piece {0, 0, block}
-        let total = u32::try_from(1 + 8 + block.len()).unwrap();
-        conn.write_all(&total.to_be_bytes()).await.unwrap();
-        conn.write_all(&[7u8]).await.unwrap();
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap();
-        conn.write_all(block).await.unwrap();
-        conn.flush().await.unwrap();
-    });
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    perform_handshake(&mut client, &ours(), INFO_HASH)
-        .await
-        .unwrap();
-    let got = download_block(&mut client, 0, 0, u32::try_from(block.len()).unwrap())
-        .await
-        .unwrap();
-    server.await.unwrap();
-    assert_eq!(got, block);
+#[test]
+fn bitfield_has_is_false_out_of_range() {
+    let bf = Bitfield::from_wire(vec![0xFF], 8).unwrap();
+    assert!(bf.has(7));
+    assert!(!bf.has(8));
+    assert!(!bf.has(u32::MAX));
 }
 
-#[tokio::test]
-async fn download_block_rejects_wrong_begin_in_piece() {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let server = tokio::spawn(async move {
-        let (mut conn, _) = listener.accept().await.unwrap();
-        let mut buf = vec![0u8; HANDSHAKE_LEN];
-        conn.read_exact(&mut buf).await.unwrap();
-        conn.write_all(&valid_reply()).await.unwrap();
-        conn.write_all(&1u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&[1u8]).await.unwrap();
-        let _request = read_request(&mut conn).await;
-        // piece {0, НЕ ЗАПРОШЕННЫЙ begin=8, блок}
-        let total = (1 + 8 + 4) as u32;
-        conn.write_all(&total.to_be_bytes()).await.unwrap();
-        conn.write_all(&[7u8]).await.unwrap();
-        conn.write_all(&0u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&8u32.to_be_bytes()).await.unwrap();
-        conn.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).await.unwrap();
-        conn.flush().await.unwrap();
-    });
-
-    let mut client = TcpStream::connect(addr).await.unwrap();
-    perform_handshake(&mut client, &ours(), INFO_HASH)
-        .await
-        .unwrap();
-    let err = download_block(&mut client, 0, 0, 4).await.unwrap_err();
-    server.await.unwrap();
+#[test]
+fn bitfield_from_wire_rejects_wrong_length() {
+    // 10 кусков требуют ровно 2 байта.
     assert!(matches!(
-        err,
-        PeerWireError::InvalidPieceBegin {
-            expected: 0,
-            got: 8
-        }
+        Bitfield::from_wire(vec![0xFF; 1], 10),
+        Err(PeerWireError::InvalidField("bitfield length"))
+    ));
+    assert!(matches!(
+        Bitfield::from_wire(vec![0xFF; 3], 10),
+        Err(PeerWireError::InvalidField("bitfield length"))
     ));
 }
 
-#[tokio::test]
-async fn download_block_rejects_zero_length() {
-    let (mut client, _server) = serve_one(|_| async {}).await;
-    let err = download_block(&mut client, 0, 0, 0).await.unwrap_err();
-    assert!(matches!(err, PeerWireError::InvalidBlockLength(0)));
-}
-
-#[tokio::test]
-async fn download_block_rejects_oversized_length() {
-    let (mut client, _server) = serve_one(|_| async {}).await;
-    let err = download_block(&mut client, 0, 0, 16 * 1024 + 1)
-        .await
-        .unwrap_err();
+#[test]
+fn bitfield_from_wire_rejects_nonzero_padding() {
+    // 9 кусков = 2 байта, 7 хвостовых бит последнего байта обязаны быть нулями.
     assert!(matches!(
-        err,
-        PeerWireError::InvalidBlockLength(n) if n == 16 * 1024 + 1
+        Bitfield::from_wire(vec![0x00, 0b1000_0001], 9),
+        Err(PeerWireError::InvalidField("bitfield padding bits"))
     ));
+    assert!(Bitfield::from_wire(vec![0x00, 0b1000_0000], 9).is_ok());
 }
 
-// Таймауты (15 с handshake / 60 с download_block) применяются вокруг всей
+#[test]
+fn bitfield_new_empty_is_all_zero() {
+    let mut bf = Bitfield::new_empty(17);
+    assert!(bf.is_empty());
+    bf.set(16);
+    bf.set(0);
+    bf.set(15);
+    assert!(bf.has(0) && bf.has(15) && bf.has(16));
+    assert!(!bf.has(1));
+    // set вне диапазона игнорируется, не паникует.
+    bf.set(17);
+    bf.set(u32::MAX);
+    assert!(bf.has(0) && bf.has(15) && bf.has(16));
+}
+
+#[test]
+fn bitfield_zero_pieces_wire_is_empty_vec() {
+    let bf = Bitfield::from_wire(Vec::new(), 0).unwrap();
+    assert!(bf.is_empty());
+    assert!(!bf.has(0));
+    let empty = Bitfield::new_empty(0);
+    assert!(empty.is_empty());
+}
+
+// Таймауты (15 с handshake) применяются вокруг всей операции; здесь
 // операции; здесь проверяем только маппинг Elapsed → Timeout — реальные 60 с
 // в тесте ждать не нужно.
 #[tokio::test]
