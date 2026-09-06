@@ -83,7 +83,7 @@ async fn full_download_debian_netinst() {
     use sha2::{Digest as _, Sha256};
 
     let bytes = std::fs::read(format!(
-        "{}/fixtures/debian-13.6.0-amd64-netinst.iso.torrent",
+        "{}/tests/fixtures/debian-13.6.0-amd64-netinst.iso.torrent",
         env!("CARGO_MANIFEST_DIR")
     ))
     .unwrap();
@@ -157,4 +157,62 @@ async fn real_udp_announce() {
         response.peers.len()
     );
     assert!(response.interval > 0, "трекер вернул невалидный interval");
+}
+
+/// Приёмка этапа 5: полный magnet-цикл — только magnet-ссылка (без .torrent
+/// и без трекеров в `tr=`): DHT → подключение → `ut_metadata` → проверка хэша →
+/// скачивание кусков → сверка размера и официального SHA-256 (эталон этапа 3).
+#[tokio::test]
+#[ignore = "ручная приёмка: нужен интернет, живой DHT-рой и ~755 МиБ трафика"]
+async fn full_magnet_download_debian_netinst() {
+    use sha2::{Digest as _, Sha256};
+
+    // info_hash из .torrent-фикстуры (проверен независимо на этапе 1) —
+    // Debian 13.6.0 netinst, тот же образ, что в full_download_debian_netinst.
+    let bytes = std::fs::read(format!(
+        "{}/tests/fixtures/debian-13.6.0-amd64-netinst.iso.torrent",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap();
+    let reference = metainfo::parse_torrent_file(&bytes).unwrap();
+    let hex_hash: String = reference
+        .info_hash
+        .iter()
+        .fold(String::new(), |acc, b| format!("{acc}{b:02x}"));
+    let uri = format!("magnet:?xt=urn:btih:{hex_hash}&dn=debian-13.6.0-amd64-netinst.iso");
+    let link = metainfo::parse_magnet_uri(&uri).unwrap();
+    assert_eq!(link.info_hash, reference.info_hash);
+    assert!(
+        link.trackers.is_empty(),
+        "чистый DHT: трекеров быть не должно"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let started = std::time::Instant::now();
+    let files = tokio::time::timeout(
+        Duration::from_secs(3600),
+        engine::download_source(engine::Source::Magnet(link), dir.path(), 6881, Some(tx)),
+    )
+    .await
+    .expect("magnet-скачивание дольше часа")
+    .expect("magnet-скачивание не удалось");
+
+    // Метаданные через ut_metadata совпали с .torrent-фикстурой.
+    let iso = &files[0];
+    let meta = std::fs::metadata(iso).unwrap();
+    assert_eq!(meta.len(), EXPECTED_SIZE, "размер образа не совпал");
+
+    let mut file = std::fs::File::open(iso).unwrap();
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher).unwrap();
+    let got = format!("{:x}", hasher.finalize());
+    println!("скачано за {:?}, SHA-256 {got}", started.elapsed());
+    assert_eq!(
+        got, EXPECTED_SHA256,
+        "SHA-256 образа не совпал с официальным"
+    );
+
+    // Прогресс-канал работал до конца.
+    while rx.try_recv().is_ok() {}
 }

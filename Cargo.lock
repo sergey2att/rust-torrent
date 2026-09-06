@@ -132,6 +132,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "dht"
+version = "0.1.0"
+dependencies = [
+ "bencode",
+ "fastrand",
+ "futures-core",
+ "metainfo",
+ "sha1",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -165,6 +180,9 @@ dependencies = [
 name = "engine"
 version = "0.1.0"
 dependencies = [
+ "bencode",
+ "dht",
+ "ext-metadata",
  "fastrand",
  "metainfo",
  "peer-wire",
@@ -190,6 +208,17 @@ checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "ext-metadata"
+version = "0.1.0"
+dependencies = [
+ "bencode",
+ "peer-wire",
+ "sha1",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -640,6 +669,7 @@ version = "0.1.0"
 dependencies = [
  "bencode",
  "hex",
+ "percent-encoding",
  "sha1",
  "thiserror",
 ]

@@ -1,0 +1,22 @@
+[package]
+name = "dht"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bencode = { path = "../bencode" }
+futures-core = "0.3"
+thiserror.workspace = true
+sha1.workspace = true
+fastrand.workspace = true
+tracing = "0.1"
+tokio = { workspace = true, features = ["net", "time", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+metainfo = { path = "../metainfo" }
+futures-core = "0.3"
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

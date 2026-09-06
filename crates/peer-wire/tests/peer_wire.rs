@@ -398,3 +398,61 @@ async fn accept_handshake_rejects_foreign_info_hash() {
         .is_err());
     server.await.unwrap();
 }
+
+async fn frame(msg: &PeerMessage) -> Vec<u8> {
+    let mut buf = Vec::new();
+    write_message(&mut buf, msg).await.unwrap();
+    buf
+}
+
+async fn unframe(bytes: &[u8]) -> Result<PeerMessage, PeerWireError> {
+    let mut cursor = bytes;
+    read_message(&mut cursor).await
+}
+
+#[tokio::test]
+async fn extended_message_round_trips_through_framing() {
+    let msg = PeerMessage::Extended {
+        ext_id: 0,
+        payload: b"d1:md11:ut_metadatai1eee".to_vec(),
+    };
+    let bytes = frame(&msg).await;
+    // ID 20 + ext_id в первом байте payload.
+    assert_eq!(&bytes[4..6], &[20, 0]);
+    match unframe(&bytes).await.unwrap() {
+        PeerMessage::Extended { ext_id, payload } => {
+            assert_eq!(ext_id, 0);
+            assert_eq!(payload, b"d1:md11:ut_metadatai1eee");
+        }
+        other => panic!("ожидалось Extended, получено {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn extended_message_with_nonstandard_id_round_trips() {
+    // Ловушка ТЗ: id ut_metadata не фиксирован — проверяем произвольный.
+    let msg = PeerMessage::Extended {
+        ext_id: 0xDD,
+        payload: vec![1, 2, 3],
+    };
+    let bytes = frame(&msg).await;
+    assert_eq!(&bytes[4..6], &[20, 0xDD]);
+    match unframe(&bytes).await.unwrap() {
+        PeerMessage::Extended { ext_id, payload } => {
+            assert_eq!(ext_id, 0xDD);
+            assert_eq!(payload, vec![1, 2, 3]);
+        }
+        other => panic!("ожидалось Extended, получено {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn extended_message_without_ext_id_is_protocol_error() {
+    // Длина 1 (только ID, payload пуст) — ext_id взять неоткуда.
+    let mut bytes = 1u32.to_be_bytes().to_vec();
+    bytes.push(20);
+    assert!(matches!(
+        unframe(&bytes).await,
+        Err(PeerWireError::InvalidField(_))
+    ));
+}

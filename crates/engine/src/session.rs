@@ -15,15 +15,17 @@ use crate::choke::ChokeManager;
 use crate::piece_manager::{PeerHandle, PieceEvent, PieceManager};
 use crate::storage::DiskStorage;
 use crate::{EngineError, MAX_CONNECTIONS};
-use metainfo::TorrentFile;
+use ext_metadata::{MetadataCollector, OUR_UT_METADATA_ID};
+use metainfo::{MagnetLink, TorrentFile};
 use peer_wire::{
     accept_handshake, perform_handshake, read_message, write_message, Bitfield, Handshake,
-    PeerMessage, PeerWireError,
+    PeerMessage, PeerWireError, EXTENDED_HANDSHAKE_ID,
 };
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -70,12 +72,41 @@ const MAX_SERVE_BLOCK: u32 = 128 * 1024;
 /// (финальный Stopped-анонс — best-effort, не блокируем выход надолго).
 const ACTOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Публичные bootstrap-узлы `DHT` (`BEP 5`).
+const DHT_BOOTSTRAP_HOSTS: &[&str] = &[
+    "router.bittorrent.com:6881",
+    "dht.transmissionbt.com:6881",
+    "router.utorrent.com:6881",
+    "dht.libtorrent.org:25401",
+    "router.bitcomet.com:6881",
+    "dht.aelitis.com:6881",
+];
+
+/// Источник содержимого сессии: готовый .torrent или `magnet`-ссылка.
+#[derive(Debug, Clone)]
+pub enum Source {
+    /// Полные метаданные: сразу фаза recheck/скачивания.
+    Torrent(TorrentFile),
+    /// Только `info_hash`: фаза метаданных (`DHT` + трекеры из `tr=`), затем
+    /// обычное скачивание в той же сессии.
+    Magnet(MagnetLink),
+}
+
+/// Информация о найденных метаданных (для UI до начала скачивания).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MetadataInfo {
+    /// Имя торрента из словаря `info`.
+    pub name: String,
+    /// Полный размер данных в байтах.
+    pub total_length: u64,
+}
+
 /// Прогресс сессии для UI.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
     /// Скачано и проверено кусков.
     pub completed_pieces: usize,
-    /// Всего кусков.
+    /// Всего кусков (0 — метаданные ещё не получены).
     pub total_pieces: usize,
     /// Скачано байт (после записи на диск).
     pub downloaded_bytes: u64,
@@ -85,6 +116,8 @@ pub struct Progress {
     pub connected_peers: usize,
     /// Идёт recheck при старте сессии: (проверено, всего).
     pub rechecking: Option<(usize, usize)>,
+    /// Верифицированные метаданные (`magnet`-фаза) — приходит один раз.
+    pub metadata: Option<MetadataInfo>,
 }
 
 /// Команда хаба peer-задаче.
@@ -111,11 +144,9 @@ enum PeerEvent {
         handle: PeerHandle,
         stream: TcpStream,
     },
-    /// Пир прислал свою битовую карту (после handshake).
-    Bitfield {
-        handle: PeerHandle,
-        bitfield: Bitfield,
-    },
+    /// Пир прислал свою битовую карту (после handshake); сырые байты —
+    /// валидация на стороне хаба (в magnet-фазе `piece_count` ещё неизвестен).
+    Bitfield { handle: PeerHandle, bytes: Vec<u8> },
     /// Пир сообщил Have.
     Have { handle: PeerHandle, index: u32 },
     /// Пир нас душил.
@@ -142,6 +173,13 @@ enum PeerEvent {
     },
     /// Соединение разорвано (обрыв, ошибка протокола, таймаут, Disconnect).
     Disconnected { handle: PeerHandle },
+    /// Extended-сообщение (`BEP 10`): маршрут решает хаб (у него есть и наш
+    /// объявленный id, и объявленный пиром).
+    Extended {
+        handle: PeerHandle,
+        ext_id: u8,
+        payload: Vec<u8>,
+    },
 }
 
 /// События для хаба.
@@ -167,6 +205,8 @@ enum HubEvent {
     },
     /// Результат анонса.
     Announce(Result<AnnounceResponse, TrackerError>),
+    /// Пиры, найденные `DHT` (или иным источником без `interval`).
+    DiscoveredPeers(Vec<PeerHandle>),
 }
 
 /// Команда задаче-писателю диска.
@@ -200,11 +240,19 @@ struct PeerLink {
     interested: bool,
     /// Мы его чокнули (по умолчанию — да, отдаём только разчокнутым).
     our_choke: bool,
+    /// Битфилд, пришедший до метаданных (`magnet`-фаза): проверим позже.
+    raw_bitfield: Option<Vec<u8>>,
+    /// Состояние обмена метаданными с этим пиром (`magnet`-фаза).
+    collector: Option<MetadataCollector>,
+    /// Локальный id `ut_metadata`, объявленный пиром (может не быть 1!).
+    peer_ut_id: Option<u8>,
 }
 
-/// Фаза сессии: recheck данных → скачивание → раздача.
+/// Фаза сессии: поиск метаданных (`magnet`) → recheck данных → скачивание →
+/// раздача.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
+    Metadata,
     Recheck,
     Download,
     Seed,
@@ -233,16 +281,57 @@ pub async fn session(
     progress: Option<mpsc::UnboundedSender<Progress>>,
     shutdown: mpsc::Receiver<()>,
 ) -> Result<Vec<PathBuf>, EngineError> {
-    run_session(
-        torrent,
+    session_source(
+        Source::Torrent(torrent),
         download_dir,
         listener,
+        progress,
+        shutdown,
+    )
+    .await
+}
+
+/// То же, что [`session`], но принимает любой источник (`.torrent` или
+/// `magnet`): для `magnet` сначала фаза метаданных (`DHT` + трекеры из `tr=`),
+/// затем обычное скачивание в той же сессии.
+///
+/// # Errors
+///
+/// Аналогично [`session`], плюс ошибки фазы метаданных:
+/// `EngineError::IdleTimeout`, если метаданные не найдены за [`IDLE_TIMEOUT`].
+pub async fn session_source(
+    source: Source,
+    download_dir: &Path,
+    listener: TcpListener,
+    progress: Option<mpsc::UnboundedSender<Progress>>,
+    shutdown: mpsc::Receiver<()>,
+) -> Result<Vec<PathBuf>, EngineError> {
+    let bootstrap = resolve_bootstrap(DHT_BOOTSTRAP_HOSTS).await;
+    run_session(
+        source,
+        download_dir,
+        listener,
+        bootstrap,
         Vec::new(),
         progress,
         true,
         shutdown,
     )
     .await
+}
+
+/// Резолвит список `host:port` в адреса (IPv4), неудачи пропускаются.
+async fn resolve_bootstrap(hosts: &[&str]) -> Vec<std::net::SocketAddr> {
+    let mut out = Vec::new();
+    for host in hosts {
+        match tokio::net::lookup_host(*host).await {
+            Ok(addrs) => {
+                out.extend(addrs.filter(std::net::SocketAddr::is_ipv4).take(1));
+            }
+            Err(err) => tracing::warn!(host, %err, "dht bootstrap dns failed"),
+        }
+    }
+    out
 }
 
 /// Скачивает торрент целиком: announce трекеру (HTTP или UDP — по схеме URL)
@@ -261,13 +350,31 @@ pub async fn download(
     port: u16,
     progress: Option<mpsc::UnboundedSender<Progress>>,
 ) -> Result<Vec<PathBuf>, EngineError> {
+    download_source(Source::Torrent(torrent), download_dir, port, progress).await
+}
+
+/// Скачивает по `magnet`-ссылке: `DHT` (публичные bootstrap-узлы) + трекеры из
+/// `tr=` параллельно → фаза метаданных через `ut_metadata` у уже подключённых
+/// пиров → обычное скачивание. Порт `port` слушается TCP+UDP; занят — ошибка.
+///
+/// # Errors
+///
+/// Аналогично [`download`]; `EngineError::IdleTimeout`, если метаданные не
+/// найдены.
+pub async fn download_source(
+    source: Source,
+    download_dir: &Path,
+    port: u16,
+    progress: Option<mpsc::UnboundedSender<Progress>>,
+) -> Result<Vec<PathBuf>, EngineError> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
-    // Держатель сигнала жив до конца функции: shutdown не срабатывает.
+    let bootstrap = resolve_bootstrap(DHT_BOOTSTRAP_HOSTS).await;
     let (_keep_alive, shutdown) = mpsc::channel::<()>(1);
     run_session(
-        torrent,
+        source,
         download_dir,
         listener,
+        bootstrap,
         Vec::new(),
         progress,
         false,
@@ -288,12 +395,36 @@ pub async fn download_with_peers(
     initial_peers: Vec<PeerHandle>,
     progress: Option<mpsc::UnboundedSender<Progress>>,
 ) -> Result<Vec<PathBuf>, EngineError> {
+    download_magnet_with_peers(
+        Source::Torrent(torrent),
+        download_dir,
+        initial_peers,
+        Vec::new(),
+        progress,
+    )
+    .await
+}
+
+/// Точка входа тестов: любой источник + заранее известные пиры + свой
+/// список bootstrap-узлов `DHT` (пустой — без `DHT`).
+///
+/// # Errors
+///
+/// Аналогично [`download_source`].
+pub async fn download_magnet_with_peers(
+    source: Source,
+    download_dir: &Path,
+    initial_peers: Vec<PeerHandle>,
+    dht_bootstrap: Vec<std::net::SocketAddr>,
+    progress: Option<mpsc::UnboundedSender<Progress>>,
+) -> Result<Vec<PathBuf>, EngineError> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     let (_keep_alive, shutdown) = mpsc::channel::<()>(1);
     run_session(
-        torrent,
+        source,
         download_dir,
         listener,
+        dht_bootstrap,
         initial_peers,
         progress,
         false,
@@ -303,59 +434,52 @@ pub async fn download_with_peers(
 }
 
 /// Общий каркас всех точек входа.
+// Длина — последовательность этапов инициализации (анонсы, DHT, recheck,
+// accept, хаб); дробление на функции создаёт прокладки без пользы.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn run_session(
-    torrent: TorrentFile,
+    source: Source,
     download_dir: &Path,
     listener: TcpListener,
+    dht_bootstrap: Vec<std::net::SocketAddr>,
     initial_peers: Vec<PeerHandle>,
     progress: Option<mpsc::UnboundedSender<Progress>>,
     seed: bool,
     shutdown: mpsc::Receiver<()>,
 ) -> Result<Vec<PathBuf>, EngineError> {
-    if torrent.info.piece_count() == 0 {
-        return Err(EngineError::InvalidTorrent("torrent has no pieces"));
-    }
-    let total_length = torrent.info.total_length();
-    let piece_count = torrent.info.piece_count();
-    let piece_length = torrent.info.piece_length;
-    let info_hash = torrent.info_hash;
+    let (magnet, torrent) = match source {
+        Source::Torrent(torrent) => {
+            if torrent.info.piece_count() == 0 {
+                return Err(EngineError::InvalidTorrent("torrent has no pieces"));
+            }
+            (None, Some(torrent))
+        }
+        Source::Magnet(link) => (Some(link), None),
+    };
+    let info_hash = match (&torrent, &magnet) {
+        (Some(t), _) => t.info_hash,
+        (None, Some(m)) => m.info_hash,
+        // Исключено конструированием Source.
+        (None, None) => return Err(EngineError::InvalidTorrent("empty source")),
+    };
     let our_peer_id = tracker::peer_id();
     let session_key = tracker::session_key();
     let announce_port = listener.local_addr()?.port();
-
-    let storage = DiskStorage::new(&torrent.info, download_dir)?;
-    let paths = storage.file_paths().to_vec();
+    let download_dir = download_dir.to_path_buf();
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
-    // Recheck при старте (промышленная норма): какие куски уже лежат на диске
-    // корректными. Хранилище уходит в задачу и возвращается хабу в
-    // RecheckDone; до этого отдача и запись невозможны — их и не будет.
-    let recheck_hashes = torrent.info.pieces.clone();
-    let recheck_event_tx = event_tx.clone();
-    let _recheck_task = tokio::task::spawn_blocking(move || {
-        for (index, expected) in recheck_hashes.iter().enumerate() {
-            let index = u32::try_from(index).unwrap_or(u32::MAX);
-            let verified = storage
-                .read_piece(index)
-                .is_ok_and(|data| Sha1::digest(&data)[..] == expected[..]);
-            // Ошибка чтения = куска нет: сессия перекачает его в фазе скачивания.
-            if recheck_event_tx
-                .send(HubEvent::Recheck { index, verified })
-                .is_err()
-            {
-                break; // хаб завершился — recheck больше не нужен
-            }
-        }
-        // Хранилище возвращается хабу: после этого можно писать и читать блоки.
-        let _ = recheck_event_tx.send(HubEvent::RecheckDone { storage });
-    });
-
-    // Анонс-актор: сессия никогда не ждёт трекер. Первый анонс — сразу после
-    // recheck (когда счётчик left достоверен).
-    let has_announce = torrent.announce.is_some();
-    let (announce_tx, announce_rx) = mpsc::unbounded_channel::<AnnounceTask>();
-    let announce_task = torrent.announce.clone().map(|url| {
+    // Анонс-акторы: по одному на трекер (torrent.announce или `magnet` `tr=`),
+    // сессия никогда не ждёт трекер.
+    let tracker_urls: Vec<String> = match &torrent {
+        Some(t) => t.announce.clone().into_iter().collect(),
+        None => magnet
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.trackers.clone()),
+    };
+    let mut announce_actors = Vec::new();
+    for url in tracker_urls {
+        let (tx, rx) = mpsc::unbounded_channel::<AnnounceTask>();
         let base = AnnounceBase {
             url,
             info_hash,
@@ -363,8 +487,67 @@ async fn run_session(
             port: announce_port,
             key: session_key,
         };
-        tokio::spawn(announce_actor(base, announce_rx, event_tx.clone()))
+        let task = tokio::spawn(announce_actor(base, rx, event_tx.clone()));
+        announce_actors.push(AnnounceActor { tx, task });
+    }
+
+    // `DHT` (только `magnet`): UDP на том же порту, что TCP-слушатель.
+    let dht_client = if magnet.is_some() {
+        match dht::DhtClient::bind(announce_port).await {
+            Ok(client) => Some(client),
+            Err(err) => {
+                tracing::warn!(%err, "dht bind failed, continuing without dht");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let dht_forward_task = dht_client.as_ref().map(|client| {
+        let client = client.clone();
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            if !dht_bootstrap.is_empty() {
+                if let Err(err) = client.bootstrap(&dht_bootstrap).await {
+                    tracing::warn!(%err, "dht bootstrap failed");
+                    return;
+                }
+            }
+            let mut peers = client.find_peers_receiver(info_hash);
+            let mut batch: Vec<PeerHandle> = Vec::new();
+            // Пачки с коротким таймаутом: не спамить событие на каждый адрес.
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), peers.recv()).await {
+                    Ok(Some(addr)) => batch.push(addr),
+                    Ok(None) => break,
+                    Err(_) => {
+                        if !batch.is_empty() {
+                            let _ = event_tx
+                                .send(HubEvent::DiscoveredPeers(std::mem::take(&mut batch)));
+                        }
+                    }
+                }
+            }
+            if !batch.is_empty() {
+                let _ = event_tx.send(HubEvent::DiscoveredPeers(batch));
+            }
+        })
     });
+
+    // Torrent: хранилище и recheck сразу; `magnet`: только после метаданных.
+    let mut paths = Vec::new();
+    let recheck_task = torrent.as_ref().map(|torrent| {
+        let storage = match DiskStorage::new(&torrent.info, &download_dir) {
+            Ok(storage) => storage,
+            Err(err) => return Err(err),
+        };
+        paths = storage.file_paths().to_vec();
+        spawn_recheck(&torrent.info, storage, event_tx.clone());
+        Ok(())
+    });
+    if let Some(Err(err)) = recheck_task {
+        return Err(err);
+    }
 
     let accept_task = tokio::spawn(accept_loop(
         listener,
@@ -373,16 +556,31 @@ async fn run_session(
         event_tx.clone(),
     ));
 
+    let (piece_count, piece_length, total_length) = torrent.as_ref().map_or((0, 0, 0), |t| {
+        (
+            t.info.piece_count(),
+            t.info.piece_length,
+            t.info.total_length(),
+        )
+    });
     let mut hub = Hub {
-        pm: PieceManager::new(&torrent.info),
+        pm: torrent.as_ref().map(|t| PieceManager::new(&t.info)),
+        torrent,
+        info_bytes: None,
+        magnet_trackers: magnet
+            .as_ref()
+            .map_or_else(Vec::new, |m| m.trackers.clone()),
+        download_dir,
+        paths,
         peers: HashMap::new(),
         tried: HashSet::new(),
         queue: VecDeque::new(),
         disk_tx: None,
         disk_task: None,
         event_tx,
-        announce_tx: has_announce.then_some(announce_tx),
+        announce_actors,
         announce_next: None,
+        dht: dht_client,
         info_hash,
         our_peer_id,
         piece_count,
@@ -395,27 +593,76 @@ async fn run_session(
         pending_writes: 0,
         recheck_total: piece_count,
         recheck_remaining: piece_count,
-        phase: Phase::Recheck,
+        phase: if magnet.as_ref().is_some() {
+            Phase::Metadata
+        } else {
+            Phase::Recheck
+        },
         seed,
         chokes: ChokeManager::new(MAX_UNCHOKED),
         progress,
         reset_idle: false,
+        metadata_info: None,
+        pending_pieces: Vec::new(),
     };
+    let has_initial_peers = !initial_peers.is_empty();
     for addr in initial_peers {
         hub.enqueue(addr);
+    }
+    // Пиры, заданные адресом (тесты), подключаем сразу — в `magnet`-фазе
+    // `DHT`-событий может не быть.
+    if has_initial_peers {
+        hub.spawn_from_queue();
     }
 
     // Teardown выполняется и при ошибке цикла: соединения/актор/диск убираются всегда.
     let session_result = session_loop(&mut hub, &mut event_rx, seed, shutdown).await;
     if matches!(session_result, Ok(true)) {
         hub.send_announce(Some(Event::Completed));
+        // `DHT`-анонс: заявляем себя в рой (best-effort, в фоне).
+        if let Some(client) = hub.dht.clone() {
+            let port = announce_port;
+            tokio::spawn(async move {
+                if let Err(err) = client.announce(info_hash, port).await {
+                    tracing::debug!(%err, "dht announce failed");
+                }
+            });
+        }
     }
-    let teardown_result = teardown_session(hub, announce_task, accept_task).await;
+    let paths = std::mem::take(&mut hub.paths);
+    let teardown_result = teardown_session(hub, dht_forward_task, accept_task).await;
     // Ошибка цикла важнее ошибки разбора.
     match (session_result, teardown_result) {
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
         (Ok(_), Ok(())) => Ok(paths),
     }
+}
+
+/// Запускает recheck диска в отдельной задаче: per-piece события + `RecheckDone`
+/// с хранилищем для задачи-писателя.
+fn spawn_recheck(
+    info: &metainfo::Info,
+    storage: DiskStorage,
+    event_tx: mpsc::UnboundedSender<HubEvent>,
+) {
+    let hashes = info.pieces.clone();
+    tokio::task::spawn_blocking(move || {
+        for (index, expected) in hashes.iter().enumerate() {
+            let index = u32::try_from(index).unwrap_or(u32::MAX);
+            let verified = storage
+                .read_piece(index)
+                .is_ok_and(|data| Sha1::digest(&data)[..] == expected[..]);
+            // Ошибка чтения = куска нет: сессия перекачает его в фазе скачивания.
+            if event_tx
+                .send(HubEvent::Recheck { index, verified })
+                .is_err()
+            {
+                break; // хаб завершился — recheck больше не нужен
+            }
+        }
+        // Хранилище возвращается хабу: после этого можно писать и читать блоки.
+        let _ = event_tx.send(HubEvent::RecheckDone { storage });
+    });
 }
 
 /// Основной цикл сессии: события хаба, сигнал остановки, дедлайны анонсов,
@@ -450,7 +697,7 @@ async fn session_loop(
                 announce_deadline = None; // до результата
             }
             _ = choke_timer.tick() => hub.recompute_chokes(),
-            () = &mut idle, if hub.phase == Phase::Download =>
+            () = &mut idle, if matches!(hub.phase, Phase::Download | Phase::Metadata) =>
                 return Err(EngineError::IdleTimeout),
         }
         if let Some(delay) = hub.announce_next.take() {
@@ -465,36 +712,44 @@ async fn session_loop(
     })
 }
 
-/// Разборка сессии: финальный Stopped-анонс (best-effort), разрыв соединений,
-/// остановка accept-лупа и анонс-актора, дожидание задачи-писателя диска.
+/// Разборка сессии: финальные Stopped-анонсы (best-effort), разрыв соединений,
+/// остановка accept-лупа, анонс-акторов и `DHT`-форвардера, дожидание
+/// задачи-писателя диска.
 async fn teardown_session(
     mut hub: Hub,
-    announce_task: Option<tokio::task::JoinHandle<()>>,
+    dht_forward_task: Option<tokio::task::JoinHandle<()>>,
     accept_task: tokio::task::JoinHandle<()>,
 ) -> Result<(), EngineError> {
-    // Финальный Stopped-анонс: best-effort, ждём недолго и обрываем актора.
-    if let Some(tx) = hub.announce_tx.take() {
-        let _ = tx.send(AnnounceTask {
+    // Финальные Stopped-анонсы: best-effort, ждём недолго и обрываем акторов.
+    let mut announce_tasks = Vec::new();
+    let uploaded = hub.uploaded_bytes;
+    let downloaded = hub.downloaded_bytes;
+    let left = hub.left();
+    for actor in hub.announce_actors.drain(..) {
+        let _ = actor.tx.send(AnnounceTask {
             event: Some(Event::Stopped),
-            uploaded: hub.uploaded_bytes,
-            downloaded: hub.downloaded_bytes,
-            left: hub.left(),
+            uploaded,
+            downloaded,
+            left,
         });
-        drop(tx); // канал закрыт: актор доработает Stopped и выйдет
+        announce_tasks.push(actor.task);
     }
     for link in hub.peers.values() {
         let _ = link.cmd_tx.send(PeerCommand::Disconnect);
     }
     accept_task.abort();
+    if let Some(task) = dht_forward_task {
+        task.abort();
+    }
     let disk_task = hub.disk_task.take();
-    drop(hub); // закрывает disk_tx — задача-писатель дообработает очередь и выйдет
+    drop(hub); // закрывает disk_tx и DhtClient — задачи дообработают и выйдут
 
-    if let Some(mut handle) = announce_task {
-        if tokio::time::timeout(ACTOR_STOP_TIMEOUT, &mut handle)
+    for mut task in announce_tasks {
+        if tokio::time::timeout(ACTOR_STOP_TIMEOUT, &mut task)
             .await
             .is_err()
         {
-            handle.abort();
+            task.abort();
         }
     }
     match disk_task {
@@ -530,6 +785,12 @@ struct AnnounceBase {
     peer_id: [u8; 20],
     port: u16,
     key: u32,
+}
+
+/// Анонс-актор: канал задач + задача. По одному на трекер.
+struct AnnounceActor {
+    tx: mpsc::UnboundedSender<AnnounceTask>,
+    task: tokio::task::JoinHandle<()>,
 }
 
 /// Анонс-актор: обрабатывает задачи последовательно (без перекрытий),
@@ -580,7 +841,7 @@ async fn accept_loop(
     event_tx: mpsc::UnboundedSender<HubEvent>,
 ) {
     let ours = Handshake {
-        reserved: [0u8; 8],
+        reserved: ext_metadata::reserved_with_extensions(),
         info_hash,
         peer_id: our_peer_id,
     };
@@ -611,7 +872,17 @@ async fn accept_loop(
 
 /// Состояние хаба.
 struct Hub {
-    pm: PieceManager,
+    /// None в `magnet`-фазе — до верифицированных метаданных.
+    pm: Option<PieceManager>,
+    /// None в `magnet`-фазе до метаданных.
+    torrent: Option<TorrentFile>,
+    /// Верифицированные метаданные (ответы на чужие `ut_metadata` request).
+    info_bytes: Option<Arc<Vec<u8>>>,
+    /// Трекеры из magnet `tr=` (для построения `TorrentFile` после метаданных).
+    magnet_trackers: Vec<String>,
+    download_dir: PathBuf,
+    /// Пути файлов торрента; для `magnet` — после метаданных.
+    paths: Vec<PathBuf>,
     peers: HashMap<PeerHandle, PeerLink>,
     /// Все адреса, которые мы уже пробовали (дедуп, без ре-коннектов).
     tried: HashSet<PeerHandle>,
@@ -620,12 +891,15 @@ struct Hub {
     disk_tx: Option<mpsc::UnboundedSender<DiskCommand>>,
     disk_task: Option<tokio::task::JoinHandle<Result<DiskStorage, EngineError>>>,
     event_tx: mpsc::UnboundedSender<HubEvent>,
-    /// Забирается при разборке, чтобы закрыть канал после Stopped.
-    announce_tx: Option<mpsc::UnboundedSender<AnnounceTask>>,
+    /// Анонс-акторы, по одному на трекер.
+    announce_actors: Vec<AnnounceActor>,
     /// Задержка до следующего анонса, выставленная последним результатом.
     announce_next: Option<Duration>,
+    /// `DHT`-клиент (только `magnet`-сценарий).
+    dht: Option<dht::DhtClient>,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
+    /// 0 в `magnet`-фазе — метаданные ещё не получены.
     piece_count: usize,
     piece_length: u64,
     total_length: u64,
@@ -640,6 +914,9 @@ struct Hub {
     uploaded_bytes: u64,
     /// Записей куска в задаче-писателе, чей ack ещё не пришёл.
     pending_writes: usize,
+    /// Куски, скачанные до появления задачи-писателя (recheck-фаза):
+    /// буферизуются и сливаются в диск при `RecheckDone`.
+    pending_pieces: Vec<(u32, Vec<u8>)>,
     recheck_total: usize,
     recheck_remaining: usize,
     phase: Phase,
@@ -648,6 +925,8 @@ struct Hub {
     chokes: ChokeManager,
     progress: Option<mpsc::UnboundedSender<Progress>>,
     reset_idle: bool,
+    /// Информация о метаданных для Progress (заполняется один раз).
+    metadata_info: Option<MetadataInfo>,
 }
 
 impl Hub {
@@ -688,30 +967,54 @@ impl Hub {
         }
     }
 
+    /// Наш ext handshake (`BEP 10`): `m.ut_metadata` + `metadata_size`, когда
+    /// метаданные уже известны.
+    fn my_ext_handshake(&self) -> Vec<u8> {
+        ext_metadata::encode_ext_handshake(self.info_bytes.as_ref().map(|b| b.len()))
+    }
+
+    /// Разрывает соединение с пиром.
+    fn disconnect(&mut self, handle: PeerHandle) {
+        if let Some(link) = self.peers.get(&handle) {
+            let _ = link.cmd_tx.send(PeerCommand::Disconnect);
+        }
+    }
+
     /// Запускает исходящую peer-задачу и регистрирует пира (bitfield —
     /// пустой, до его первого сообщения).
     fn spawn_peer(&mut self, addr: PeerHandle) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let piece_count = self.torrent.as_ref().map_or(0, |t| t.info.piece_count());
         self.peers.insert(
             addr,
             PeerLink {
                 cmd_tx,
-                bitfield: Bitfield::new_empty(self.piece_count),
+                bitfield: Bitfield::new_empty(piece_count),
                 unchoked: false,
                 interested: false,
                 our_choke: true,
+                raw_bitfield: None,
+                collector: None,
+                peer_ut_id: None,
             },
         );
-        let my_bitfield = self.my_bitfield_bytes();
-        let send_interested = !self.pm.is_complete();
+        // Битфилд — one-shot: в фазах Recheck/Metadata on_disk неполный, полный
+        // уйдёт в initialize_peers_for_download после RecheckDone.
+        let my_bitfield = if matches!(self.phase, Phase::Recheck | Phase::Metadata) {
+            Vec::new()
+        } else {
+            self.my_bitfield_bytes()
+        };
+        let ext_handshake = self.my_ext_handshake();
+        let send_interested = !self.pm.as_ref().is_some_and(PieceManager::is_complete);
         tokio::spawn(peer_task(
             addr,
             PeerMode::Outbound,
             None,
             self.info_hash,
             self.our_peer_id,
-            self.piece_count,
             my_bitfield,
+            ext_handshake,
             send_interested,
             cmd_rx,
             self.event_tx.clone(),
@@ -721,25 +1024,36 @@ impl Hub {
     /// Регистрирует входящего пира и запускает его задачу с готовым потоком.
     fn register_inbound(&mut self, handle: PeerHandle, stream: TcpStream) {
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let piece_count = self.torrent.as_ref().map_or(0, |t| t.info.piece_count());
         self.peers.insert(
             handle,
             PeerLink {
                 cmd_tx,
-                bitfield: Bitfield::new_empty(self.piece_count),
+                bitfield: Bitfield::new_empty(piece_count),
                 unchoked: false,
                 interested: false,
                 our_choke: true,
+                raw_bitfield: None,
+                collector: None,
+                peer_ut_id: None,
             },
         );
-        let my_bitfield = self.my_bitfield_bytes();
+        // Битфилд — one-shot: в фазах Recheck/Metadata on_disk неполный, полный
+        // уйдёт в initialize_peers_for_download после RecheckDone.
+        let my_bitfield = if matches!(self.phase, Phase::Recheck | Phase::Metadata) {
+            Vec::new()
+        } else {
+            self.my_bitfield_bytes()
+        };
+        let ext_handshake = self.my_ext_handshake();
         tokio::spawn(peer_task(
             handle,
             PeerMode::Inbound,
             Some(stream),
             self.info_hash,
             self.our_peer_id,
-            self.piece_count,
             my_bitfield,
+            ext_handshake,
             false,
             cmd_rx,
             self.event_tx.clone(),
@@ -748,6 +1062,7 @@ impl Hub {
 
     /// Обрабатывает одно событие; `Ok(true)` — скачивание завершено
     /// (все куски проверены и записаны).
+    #[allow(clippy::too_many_lines)]
     fn on_event(&mut self, event: HubEvent) -> Result<bool, EngineError> {
         match event {
             HubEvent::Peer(peer_event) => {
@@ -762,7 +1077,8 @@ impl Hub {
                     self.reset_idle = true;
                     self.emit_progress();
                     // Готово: все куски проверены и записаны.
-                    Ok(self.pm.is_complete() && self.pending_writes == 0)
+                    Ok(self.pm.as_ref().is_some_and(PieceManager::is_complete)
+                        && self.pending_writes == 0)
                 }
                 Err(err) => Err(err.into()),
             },
@@ -794,7 +1110,9 @@ impl Hub {
                 self.recheck_remaining = self.recheck_remaining.saturating_sub(1);
                 if verified {
                     self.verified_bytes += self.piece_len(index);
-                    self.pm.mark_verified(index);
+                    if let Some(pm) = self.pm.as_mut() {
+                        pm.mark_verified(index);
+                    }
                     self.on_disk.set(index);
                 }
                 self.emit_progress();
@@ -807,13 +1125,21 @@ impl Hub {
                     disk_rx,
                     self.event_tx.clone(),
                 )));
+                // Скачанное во время recheck — первым в FIFO (порядок бесплатен).
+                let buffered = std::mem::take(&mut self.pending_pieces);
+                for (index, data) in buffered {
+                    let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
+                }
                 self.disk_tx = Some(disk_tx);
-                self.phase = if self.pm.is_complete() {
+                self.phase = if self.pm.as_ref().is_some_and(PieceManager::is_complete) {
                     Phase::Seed
                 } else {
                     Phase::Download
                 };
                 self.send_announce(Some(Event::Started));
+                // Битфилд и interested — только теперь, когда on_disk известен
+                // (в `magnet`-фазе до этого нечего было отправлять).
+                self.initialize_peers_for_download();
                 // Очередь могла наполниться от первого анонса во время recheck.
                 if self.phase == Phase::Download {
                     self.spawn_from_queue();
@@ -830,7 +1156,7 @@ impl Hub {
                             self.enqueue(addr);
                         }
                         // К пиру подключаемся, пока качаем; сидер принимает входящие.
-                        if self.phase == Phase::Download {
+                        if matches!(self.phase, Phase::Download | Phase::Metadata) {
                             self.spawn_from_queue();
                         }
                     }
@@ -842,10 +1168,28 @@ impl Hub {
                 }
                 Ok(false)
             }
+            HubEvent::DiscoveredPeers(peers) => {
+                for addr in peers {
+                    self.enqueue(addr);
+                }
+                // Ищем пиров и в `magnet`-фазе (для метаданных), и при скачивании.
+                if matches!(self.phase, Phase::Download | Phase::Metadata) {
+                    self.spawn_from_queue();
+                }
+                self.emit_progress();
+                Ok(false)
+            }
         }
     }
 
+    // Один матч по всем вариантам PeerEvent; выделение веток в методы
+    // оставит функции-прокладки по 3 строки.
+    #[allow(clippy::too_many_lines)]
     fn on_peer_event(&mut self, event: PeerEvent) {
+        // Любая активность пира в magnet-фазе — признак жизни (idle-таймер).
+        if self.phase == Phase::Metadata {
+            self.reset_idle = true;
+        }
         match event {
             PeerEvent::InboundConnected { handle, stream } => {
                 if self.peers.len() < MAX_CONNECTIONS && !self.peers.contains_key(&handle) {
@@ -853,15 +1197,36 @@ impl Hub {
                 }
                 // Иначе соединение тихо закрывается (поток дропается).
             }
-            PeerEvent::Bitfield { handle, bitfield } => {
-                self.pm.on_peer_bitfield(handle, &bitfield);
-                if let Some(link) = self.peers.get_mut(&handle) {
-                    link.bitfield = bitfield;
+            PeerEvent::Bitfield { handle, bytes } => {
+                let Some(torrent) = self.torrent.as_ref() else {
+                    // Magnet-фаза: piece_count неизвестен — валидация позже.
+                    if let Some(link) = self.peers.get_mut(&handle) {
+                        link.raw_bitfield = Some(bytes);
+                    }
+                    return;
+                };
+                let piece_count = torrent.info.piece_count();
+                match Bitfield::from_wire(bytes, piece_count) {
+                    Ok(bitfield) => {
+                        if let Some(pm) = self.pm.as_mut() {
+                            pm.on_peer_bitfield(handle, &bitfield);
+                        }
+                        if let Some(link) = self.peers.get_mut(&handle) {
+                            link.bitfield = bitfield;
+                        }
+                        self.refill(handle);
+                    }
+                    Err(err) => {
+                        // Кривая карта — пиру нельзя доверять.
+                        tracing::debug!(peer = %handle, %err, "invalid bitfield, disconnecting");
+                        self.disconnect(handle);
+                    }
                 }
-                self.refill(handle);
             }
             PeerEvent::Have { handle, index } => {
-                self.pm.on_peer_have(handle, index);
+                if let Some(pm) = self.pm.as_mut() {
+                    pm.on_peer_have(handle, index);
+                }
                 if let Some(link) = self.peers.get_mut(&handle) {
                     link.bitfield.set(index);
                 }
@@ -871,7 +1236,9 @@ impl Hub {
                     link.unchoked = false;
                 }
                 // Недополученные блоки возвращаются в пул.
-                self.pm.release_in_flight(handle);
+                if let Some(pm) = self.pm.as_mut() {
+                    pm.release_in_flight(handle);
+                }
             }
             PeerEvent::Unchoke { handle } => {
                 if let Some(link) = self.peers.get_mut(&handle) {
@@ -903,35 +1270,352 @@ impl Hub {
                 index,
                 begin,
                 data,
-            } => match self.pm.on_block_received(handle, index, begin, &data) {
-                Ok(PieceEvent::BlockStored) => self.refill(handle),
-                Ok(PieceEvent::PieceCompleted { index, data }) => {
-                    // Кусок проверен in-memory — уходит на диск целиком,
-                    // испорченные куски диск не касаются.
-                    self.pending_writes += 1;
-                    if let Some(disk_tx) = &self.disk_tx {
-                        let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
+            } => {
+                let Some(pm) = self.pm.as_mut() else {
+                    return; // magnet-фаза: запросов не шлём, блоков не бывает
+                };
+                match pm.on_block_received(handle, index, begin, &data) {
+                    Ok(PieceEvent::BlockStored) => self.refill(handle),
+                    Ok(PieceEvent::PieceCompleted { index, data }) => {
+                        // Кусок проверен in-memory — уходит на диск целиком,
+                        // испорченные куски диск не касаются. Пока задачи-
+                        // писателя нет (recheck-фаза), буферизуем.
+                        self.pending_writes += 1;
+                        match &self.disk_tx {
+                            Some(disk_tx) => {
+                                let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
+                            }
+                            None => self.pending_pieces.push((index, data)),
+                        }
+                        self.refill(handle);
                     }
-                    self.refill(handle);
-                }
-                Ok(PieceEvent::PieceHashMismatch { index }) => {
-                    tracing::warn!(piece = index, peer = %handle, "piece hash mismatch, refetching");
-                    self.refill(handle);
-                }
-                Err(err) => {
-                    // Протокольное нарушение — тихо выбываем (без ретраев).
-                    tracing::warn!(peer = %handle, %err, "bad block, disconnecting peer");
-                    if let Some(link) = self.peers.get(&handle) {
-                        let _ = link.cmd_tx.send(PeerCommand::Disconnect);
+                    Ok(PieceEvent::PieceHashMismatch { index }) => {
+                        tracing::warn!(piece = index, peer = %handle, "piece hash mismatch, refetching");
+                        self.refill(handle);
+                    }
+                    Err(err) => {
+                        // Протокольное нарушение — тихо выбываем (без ретраев).
+                        tracing::warn!(peer = %handle, %err, "bad block, disconnecting peer");
+                        self.disconnect(handle);
                     }
                 }
-            },
+            }
+            PeerEvent::Extended {
+                handle,
+                ext_id,
+                payload,
+            } => self.on_extended(handle, ext_id, &payload),
             PeerEvent::Disconnected { handle } => {
-                self.pm.on_peer_disconnected(handle);
+                if let Some(pm) = self.pm.as_mut() {
+                    pm.on_peer_disconnected(handle);
+                }
                 self.peers.remove(&handle);
                 self.spawn_from_queue();
                 self.emit_progress();
             }
+        }
+    }
+
+    /// Обрабатывает extended-сообщение (BEP 10/9): маршрутизация по содержимому
+    /// (`msg_type`), а не только по `ext_id`: Request — к нам, Data/Reject —
+    /// ответ на наш запрос; при равных объявленных id это различает их
+    /// однозначно.
+    fn on_extended(&mut self, handle: PeerHandle, ext_id: u8, payload: &[u8]) {
+        if ext_id == EXTENDED_HANDSHAKE_ID {
+            self.on_ext_handshake(handle, payload);
+            return;
+        }
+        let msg = match ext_metadata::parse_metadata_message(payload) {
+            Ok(msg) => msg,
+            Err(err) => {
+                tracing::debug!(peer = %handle, %err, "malformed extended payload");
+                // Кривой payload — только в `magnet`-фазе это проблема.
+                if self.phase == Phase::Metadata {
+                    self.disconnect(handle);
+                }
+                return;
+            }
+        };
+        match msg {
+            ext_metadata::MetadataMessage::Request { piece } => {
+                self.serve_metadata_request(handle, piece);
+            }
+            ext_metadata::MetadataMessage::Data { piece, data } => {
+                self.on_metadata_piece(handle, piece, &data);
+            }
+            ext_metadata::MetadataMessage::Reject { piece } => {
+                self.on_metadata_reject(handle, piece);
+            }
+        }
+    }
+
+    /// Пир прислал свой ext handshake: запоминаем его `ut_metadata` id; в
+    /// magnet-фазе — запускаем обмен метаданными (без поддержки/с кривым
+    /// размером — disconnect, он нам в этой фазе бесполезен).
+    fn on_ext_handshake(&mut self, handle: PeerHandle, payload: &[u8]) {
+        let hs = match ext_metadata::parse_ext_handshake(payload) {
+            Ok(hs) => hs,
+            Err(err) => {
+                tracing::debug!(peer = %handle, %err, "malformed ext handshake");
+                if self.phase == Phase::Metadata {
+                    self.disconnect(handle);
+                }
+                return;
+            }
+        };
+        if let Some(link) = self.peers.get_mut(&handle) {
+            link.peer_ut_id = hs.ut_metadata_id;
+        }
+        if self.phase != Phase::Metadata {
+            return; // метаданные уже есть/не нужны — дальше обычный протокол
+        }
+        let Some(peer_ut_id) = hs.ut_metadata_id else {
+            tracing::debug!(peer = %handle, "no ut_metadata support, disconnecting");
+            self.disconnect(handle);
+            return;
+        };
+        let Some(size) = hs.metadata_size else {
+            tracing::debug!(peer = %handle, "ext handshake without metadata_size, disconnecting");
+            self.disconnect(handle);
+            return;
+        };
+        let total = match ext_metadata::check_metadata_size(size) {
+            Ok(total) => total,
+            Err(err) => {
+                tracing::debug!(peer = %handle, %err, "invalid metadata_size, disconnecting");
+                self.disconnect(handle);
+                return;
+            }
+        };
+        let collector = match MetadataCollector::new(total, self.info_hash) {
+            Ok(collector) => collector,
+            Err(err) => {
+                tracing::debug!(peer = %handle, %err, "metadata_size rejected");
+                self.disconnect(handle);
+                return;
+            }
+        };
+        // Запрашиваем кусок 0 (дальше — по мере получения).
+        let request = ext_metadata::encode_metadata_request(0);
+        if let Some(link) = self.peers.get(&handle) {
+            let _ = link
+                .cmd_tx
+                .send(PeerCommand::Message(PeerMessage::Extended {
+                    ext_id: peer_ut_id,
+                    payload: request,
+                }));
+        }
+        if let Some(link) = self.peers.get_mut(&handle) {
+            link.collector = Some(collector);
+        }
+    }
+
+    /// Отвечает на чужой `ut_metadata` request: data при наличии верифицированных
+    /// метаданных, reject иначе; disconnect не делаем.
+    fn serve_metadata_request(&mut self, handle: PeerHandle, piece: u32) {
+        let reply = self.info_bytes.as_ref().map_or_else(
+            || {
+                ext_metadata::encode_metadata_reply(&ext_metadata::MetadataMessage::Reject {
+                    piece,
+                })
+            },
+            |bytes| {
+                let start = piece as usize * ext_metadata::METADATA_PIECE_LEN;
+                if start >= bytes.len() {
+                    ext_metadata::encode_metadata_reply(&ext_metadata::MetadataMessage::Reject {
+                        piece,
+                    })
+                } else {
+                    let end = (start + ext_metadata::METADATA_PIECE_LEN).min(bytes.len());
+                    ext_metadata::encode_metadata_reply(&ext_metadata::MetadataMessage::Data {
+                        piece,
+                        data: bytes[start..end].to_vec(),
+                    })
+                }
+            },
+        );
+        if let Some(link) = self.peers.get(&handle) {
+            let _ = link
+                .cmd_tx
+                .send(PeerCommand::Message(PeerMessage::Extended {
+                    ext_id: OUR_UT_METADATA_ID,
+                    payload: reply,
+                }));
+        }
+    }
+
+    /// Пир прислал кусок метаданных: продвижение последовательного обмена;
+    /// последний кусок запускает построение торрента (первый победил).
+    #[allow(clippy::too_many_lines)]
+    fn on_metadata_piece(&mut self, handle: PeerHandle, piece: u32, data: &[u8]) {
+        enum Outcome {
+            RequestNext(u32, u8),
+            Complete(Vec<u8>),
+            Fail,
+        }
+        let outcome = {
+            let Some(link) = self.peers.get_mut(&handle) else {
+                return;
+            };
+            let Some(collector) = link.collector.as_mut() else {
+                return; // кусок без активного обмена — игнор
+            };
+            match collector.on_piece(piece, data) {
+                Ok(None) => match collector.next_request() {
+                    Some((next, _)) => {
+                        Outcome::RequestNext(next, link.peer_ut_id.unwrap_or(OUR_UT_METADATA_ID))
+                    }
+                    None => Outcome::Fail,
+                },
+                Ok(Some(verified)) => Outcome::Complete(verified),
+                Err(err) => {
+                    tracing::debug!(peer = %handle, piece, %err, "bad metadata piece");
+                    Outcome::Fail
+                }
+            }
+        };
+        match outcome {
+            Outcome::RequestNext(next, ext_id) => {
+                let payload = ext_metadata::encode_metadata_request(next);
+                if let Some(link) = self.peers.get(&handle) {
+                    let _ = link
+                        .cmd_tx
+                        .send(PeerCommand::Message(PeerMessage::Extended {
+                            ext_id,
+                            payload,
+                        }));
+                }
+            }
+            Outcome::Complete(verified) => {
+                if let Some(link) = self.peers.get_mut(&handle) {
+                    link.collector = None;
+                }
+                if let Err(err) = self.metadata_complete(verified) {
+                    tracing::warn!(peer = %handle, %err, "metadata rejected");
+                }
+            }
+            Outcome::Fail => {
+                // Пир бесполезен для метаданных — disconnect (адрес дедупнут).
+                if let Some(link) = self.peers.get_mut(&handle) {
+                    link.collector = None;
+                }
+                self.disconnect(handle);
+            }
+        }
+    }
+
+    /// Пир отказался отдавать кусок: в `magnet`-фазе disconnect, метаданные
+    /// возьмём у другого пира.
+    fn on_metadata_reject(&mut self, handle: PeerHandle, piece: u32) {
+        tracing::debug!(peer = %handle, piece, "metadata piece rejected");
+        if let Some(link) = self.peers.get_mut(&handle) {
+            if link.collector.is_some() {
+                link.collector = None;
+                self.disconnect(handle);
+            }
+        }
+    }
+
+    /// Верифицированные метаданные получены: строим торрент, инициализируем
+    /// хранилище/PieceManager, запускаем recheck. Первые метаданные побеждают.
+    fn metadata_complete(&mut self, info_bytes: Vec<u8>) -> Result<(), EngineError> {
+        if self.torrent.is_some() {
+            return Ok(()); // другой пир уже победил
+        }
+        let info = metainfo::parse_info_bytes(&info_bytes).map_err(|_| {
+            EngineError::InvalidTorrent("fetched metadata is not a valid info dict")
+        })?;
+        if info.piece_count() == 0 {
+            return Err(EngineError::InvalidTorrent("metadata has no pieces"));
+        }
+        let piece_count = info.piece_count();
+        let piece_length = info.piece_length;
+        let total_length = info.total_length();
+
+        let storage = DiskStorage::new(&info, &self.download_dir)?;
+        self.paths = storage.file_paths().to_vec();
+        spawn_recheck(&info, storage, self.event_tx.clone());
+        let pm = PieceManager::new(&info);
+
+        let trackers = std::mem::take(&mut self.magnet_trackers);
+        let torrent = TorrentFile {
+            announce: trackers.first().cloned(),
+            announce_list: trackers.iter().cloned().map(|t| vec![t]).collect(),
+            info_hash: self.info_hash,
+            info_bytes: info_bytes.clone(),
+            info,
+            comment: None,
+            created_by: None,
+        };
+        self.metadata_info = Some(MetadataInfo {
+            name: torrent.info.name.clone(),
+            total_length,
+        });
+        self.info_bytes = Some(Arc::new(info_bytes));
+        self.torrent = Some(torrent);
+        self.pm = Some(pm);
+
+        // Переигрываем битфилды, пришедшие в `magnet`-фазе (теперь piece_count
+        // известен и можно валидировать).
+        let raw: Vec<(PeerHandle, Vec<u8>)> = self
+            .peers
+            .iter_mut()
+            .filter_map(|(handle, link)| link.raw_bitfield.take().map(|b| (*handle, b)))
+            .collect();
+        if let Some(pm) = self.pm.as_mut() {
+            for (handle, bytes) in raw {
+                match Bitfield::from_wire(bytes, piece_count) {
+                    Ok(bitfield) => {
+                        pm.on_peer_bitfield(handle, &bitfield);
+                        if let Some(link) = self.peers.get_mut(&handle) {
+                            link.bitfield = bitfield;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(peer = %handle, %err, "invalid bitfield, disconnecting");
+                        if let Some(link) = self.peers.get(&handle) {
+                            let _ = link.cmd_tx.send(PeerCommand::Disconnect);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.piece_count = piece_count;
+        self.piece_length = piece_length;
+        self.total_length = total_length;
+        self.on_disk = Bitfield::new_empty(piece_count);
+        self.recheck_total = piece_count;
+        self.recheck_remaining = piece_count;
+        self.phase = Phase::Recheck;
+        // Коллекторы остальных пиров больше не нужны (метаданные у нас).
+        for link in self.peers.values_mut() {
+            link.collector = None;
+        }
+        self.emit_progress();
+        Ok(())
+    }
+
+    /// После recheck: всем живым пирам — наш битфилд (один раз, при переходе
+    /// к скачиванию) и interested, если ещё качаем.
+    fn initialize_peers_for_download(&mut self) {
+        let my_bitfield = self.my_bitfield_bytes();
+        let send_interested = !self.pm.as_ref().is_some_and(PieceManager::is_complete);
+        let handles: Vec<PeerHandle> = self.peers.keys().copied().collect();
+        for handle in handles {
+            if let Some(link) = self.peers.get(&handle) {
+                if !my_bitfield.is_empty() {
+                    let _ = link.cmd_tx.send(PeerCommand::Message(PeerMessage::Bitfield(
+                        my_bitfield.clone(),
+                    )));
+                }
+                if send_interested {
+                    let _ = link
+                        .cmd_tx
+                        .send(PeerCommand::Message(PeerMessage::Interested));
+                }
+            }
+            self.refill(handle);
         }
     }
 
@@ -962,6 +1646,9 @@ impl Hub {
     /// Входящий Request: отдаём блок только заинтересованному и разчокнутому
     /// пиру (choke-состояние — источник истины), читая через задачу диска.
     fn on_upload_request(&mut self, handle: PeerHandle, index: u32, begin: u32, length: u32) {
+        if self.torrent.is_none() {
+            return; // magnet-фаза: отдавать нечего
+        }
         if let Some(link) = self.peers.get(&handle) {
             if !link.interested || link.our_choke {
                 return; // чокнутым и не-интересованным не отвечаем
@@ -1009,12 +1696,15 @@ impl Hub {
         if !link.unchoked {
             return;
         }
-        while self.pm.in_flight_count(handle) < PIPELINE {
-            let Some(request) = self.pm.next_block_request(handle, &link.bitfield) else {
+        let Some(pm) = self.pm.as_mut() else {
+            return; // magnet-фаза: качать пока нечего
+        };
+        while pm.in_flight_count(handle) < PIPELINE {
+            let Some(request) = pm.next_block_request(handle, &link.bitfield) else {
                 break;
             };
             // Endgame: дубликат уже in-flight — просим остальных отмениться.
-            for other in self.pm.cancel_targets(&request, handle) {
+            for other in pm.cancel_targets(&request, handle) {
                 if let Some(other_link) = self.peers.get(&other) {
                     let _ = other_link
                         .cmd_tx
@@ -1040,10 +1730,10 @@ impl Hub {
         }
     }
 
-    /// Отправляет анонс-актору задачу (если в сессии есть трекер).
+    /// Отправляет всем анонс-акторам задачу (если в сессии есть трекеры).
     fn send_announce(&self, event: Option<Event>) {
-        if let Some(tx) = &self.announce_tx {
-            let _ = tx.send(AnnounceTask {
+        for actor in &self.announce_actors {
+            let _ = actor.tx.send(AnnounceTask {
                 event,
                 uploaded: self.uploaded_bytes,
                 downloaded: self.downloaded_bytes,
@@ -1061,12 +1751,13 @@ impl Hub {
                 )
             });
             let _ = tx.send(Progress {
-                completed_pieces: self.pm.completed_pieces(),
+                completed_pieces: self.pm.as_ref().map_or(0, PieceManager::completed_pieces),
                 total_pieces: self.piece_count,
                 downloaded_bytes: self.downloaded_bytes,
                 uploaded_bytes: self.uploaded_bytes,
                 connected_peers: self.peers.len(),
                 rechecking,
+                metadata: self.metadata_info.clone(),
             });
         }
     }
@@ -1136,11 +1827,11 @@ async fn disk_writer(
 
 /// Peer-задача: стейт-машина одного соединения.
 ///
-/// Исходящее: connect+handshake (10 с) → наши bitfield (если есть куски) и
-/// Interested (если докачиваем). Входящее: handshake уже выполнен accept-лупом,
-/// остальное то же, без Interested. Команды хаба обрабатываются между
-/// сообщениями. Любая ошибка — тихое выбытие: одна `Disconnected` в хаб и
-/// выход, без ретраев.
+/// Исходящее: connect+handshake (10 с) → наш ext handshake (`BEP 10`) → наши
+/// bitfield (если есть куски) и Interested (если докачиваем). Входящее:
+/// handshake уже выполнен accept-лупом, остальное то же, без Interested.
+/// Команды хаба обрабатываются между сообщениями. Любая ошибка — тихое
+/// выбытие: одна `Disconnected` в хаб и выход, без ретраев.
 // Аргументы peer_task зеркалят поверхность протокола (пир/режим/состояние
 // хендшейка + каналы); группировка в структуру добавила бы прокладку на два
 // вызова, поэтому допускаем 10 параметров явно.
@@ -1151,8 +1842,8 @@ async fn peer_task(
     inbound: Option<TcpStream>,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
-    piece_count: usize,
     my_bitfield: Vec<u8>,
+    ext_handshake: Vec<u8>,
     send_interested: bool,
     mut cmd_rx: mpsc::UnboundedReceiver<PeerCommand>,
     event_tx: mpsc::UnboundedSender<HubEvent>,
@@ -1172,7 +1863,7 @@ async fn peer_task(
             let connect = tokio::time::timeout(CONNECT_TIMEOUT, async {
                 let mut stream = TcpStream::connect(handle).await?;
                 let ours = Handshake {
-                    reserved: [0u8; 8],
+                    reserved: ext_metadata::reserved_with_extensions(),
                     info_hash,
                     peer_id: our_peer_id,
                 };
@@ -1188,8 +1879,16 @@ async fn peer_task(
             stream
         }
     };
-    tracing::debug!(peer = %handle, "handshake ok");
-    // Сразу после handshake объявляем свои куски и интерес — дальше их не шлём.
+    // Сразу после handshake: объявляем поддержку расширений (`BEP 10`), свои
+    // куски и интерес — дальше их не шлём.
+    let ext = PeerMessage::Extended {
+        ext_id: EXTENDED_HANDSHAKE_ID,
+        payload: ext_handshake,
+    };
+    if write_message(&mut stream, &ext).await.is_err() {
+        notify(PeerEvent::Disconnected { handle });
+        return;
+    }
     if !my_bitfield.is_empty()
         && write_message(&mut stream, &PeerMessage::Bitfield(my_bitfield))
             .await
@@ -1233,7 +1932,7 @@ async fn peer_task(
             }
             incoming = msg_rx.recv() => match incoming {
                 Some(Ok(message)) => {
-                    if !on_peer_message(handle, message, &mut got_bitfield, piece_count, &notify) {
+                                        if !on_peer_message(handle, message, &mut got_bitfield, &notify) {
                         tracing::debug!(peer = %handle, "exit: protocol violation on incoming");
                         break;
                     }
@@ -1260,7 +1959,6 @@ fn on_peer_message(
     handle: PeerHandle,
     message: PeerMessage,
     got_bitfield: &mut bool,
-    piece_count: usize,
     notify: &impl Fn(PeerEvent),
 ) -> bool {
     match message {
@@ -1305,12 +2003,9 @@ fn on_peer_message(
                 return false;
             }
             *got_bitfield = true;
-            if let Ok(bitfield) = Bitfield::from_wire(bytes, piece_count) {
-                notify(PeerEvent::Bitfield { handle, bitfield });
-            } else {
-                tracing::debug!(peer = %handle, "exit: invalid bitfield from wire");
-                return false;
-            }
+            // Валидация на стороне хаба: в `magnet`-фазе piece_count ещё
+            // неизвестен.
+            notify(PeerEvent::Bitfield { handle, bytes });
         }
         PeerMessage::Piece {
             index,
@@ -1326,6 +2021,13 @@ fn on_peer_message(
             });
         }
         PeerMessage::KeepAlive | PeerMessage::Port(_) | PeerMessage::Cancel { .. } => {}
+        PeerMessage::Extended { ext_id, payload } => {
+            notify(PeerEvent::Extended {
+                handle,
+                ext_id,
+                payload,
+            });
+        }
     }
     true
 }
@@ -1345,7 +2047,7 @@ async fn peer_reader(
                     return; // основная задача завершилась — сессия закрыта
                 }
             }
-            // BEP 10: неизвестные ID (расширения) пропускаются, соединение
+            // `BEP 10`: неизвестные ID (расширения) пропускаются, соединение
             // живёт — иначе не выжить в современном сворме (id 20 шлют все).
             Ok(Err(PeerWireError::UnknownMessage(_))) => {
                 tracing::debug!(peer = %handle, "unknown message id skipped");

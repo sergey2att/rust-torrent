@@ -21,8 +21,8 @@ crates/
 ├── peer-wire/     # handshake + фрейминг сообщений пиров (этап 2) ✅, этап 6 — расширения
 ├── cli/           # бинарник для сквозной проверки этапов ✅ (этап 3: полное скачивание)
 ├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce/seeding (этап 4) ✅
-├── dht/           # Kademlia DHT (этап 5)                               — ещё не создан
-├── ext-metadata/  # extension protocol + ut_metadata (этап 5)           — ещё не создан
+├── dht/           # Kademlia DHT (этап 5) ✅
+├── ext-metadata/  # extension protocol + ut_metadata (этап 5) ✅
 ├── ext-pex/       # ut_pex (этап 6)                                     — ещё не создан
 └── nat/           # UPnP/NAT-PMP (этап 6)                               — ещё не создан
 ```
@@ -139,10 +139,23 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 2. ✅ HTTP-announce + peer handshake (сквозной цикл проверен на живом торренте Debian 13.6)
 3. ✅ Менеджер кусков, дисковый слой, пайплайн скачивания (приёмка: Debian 13.6 netinst 755 МБ, SHA-256 совпал с официальным)
 4. ✅ UDP-трекеры + seeding/choking (NAT через порт — этап 6)
-5. DHT, magnet-ссылки, extension protocol + ut_metadata
+5. ✅ DHT, magnet-ссылки, extension protocol + ut_metadata (приёмка: magnet без tr= по чистому DHT, Debian 13.6 netinst 755 МБ, SHA-256 совпал)
 6. ut_pex, UPnP/NAT-PMP, полировка peer-wire
 
 Каждый новый этап начинается с прожарки требований (grill), итоги — в `GRILL-ME-stage<N>.md`.
+
+## Решения этапа 5 (не менять без обсуждения)
+
+Полный разбор — в `GRILL-ME-stage5.md`. Ключевое:
+
+- **dht**: полные k-buckets (k=8), а не плоский кэш; публичный контракт — `find_peers` → `impl Stream` (dep futures-core, без рантайма), внутри актор + mpsc. Полный responder (ping/find_node/get_peers/announce_peer, token TTL 5 мин, error 203 без token). Константы: α=3, KRPC timeout 2 с без ретраев, tx-id 2 байта, кэш пиров 256/info_hash, budget обхода 96.
+- **Ловушка обхода (found the hard way)**: капа кандидатов — только по НЕопрошенным (`candidates.retain(!queried)`), иначе фронт вырождается и обход останавливается на 16 узлах, не дойдя до values; `merge_candidates` сортирует по расстоянию до **target**, не до себя. Декремент бюджета — в момент пуша кандидата, не при отправке: иначе при budget 1..2 и пуше ALPHA=3 — underflow и смерть актора (регресс-тест в `dht/src/lib.rs`, шов `lookup(..., budget)`).
+- **magnet**: парсинг в metainfo (hex-40 + base32-32, btmh/v2 → `UnsupportedMagnet`, несколько btih → ошибка); сценарий целиком внутри engine — `session_source(Source::Torrent|Magnet)`, фаза метаданных в той же сессии: пиры без ext-бита отключаются сразу, после метаданных — переинициализация живых peer-задач. Источники пиров — DHT + трекеры из `tr=` параллельно; DHT-UDP биндится на тот же порт, что TCP-слушатель.
+- **ext-metadata (BEP 9)**: SHA-1-проверка внутри `fetch_metadata` (fail-closed, `HashMismatch`); куски 16 КиБ последовательно в соединении, гонка ext-пиров в engine; metadata_size 0 или > 4 МиБ → disconnect. Чужие ut_metadata request обслуживаем: data при верифицированных метаданных, reject иначе.
+- **Ловушка битфилда (one-shot)**: в фазах Recheck/Metadata on_disk неполный — битфилд при спавне peer-задачи не шлётся вовсе, полный уходит один раз в `initialize_peers_for_download` после RecheckDone; частичный битфилд при спавне + повторный после recheck = «повторный bitfield» → пир-нарушитель, соединение рвётся (флейк `seeder_serves_full_torrent_to_leecher`).
+- **PeerEvent::Bitfield несёт сырые байты**: валидация `Bitfield::from_wire` в хабе (в magnet-фазе piece_count ещё неизвестен); Extended-сообщения маршрутизирует хаб по содержимому (Request/Data/Reject), не только по ext_id (чужой id не фиксирован).
+- **CLI**: аргумент — `.torrent` или magnet (автоопределение по префиксу); `HubEvent::Metadata` (имя+размер) для прогресса до начала скачивания.
+- **Зависимости**: futures-core (dht), больше новых нет — bencode/sha1/fastrand уже в дереве.
 
 ## Решения этапа 4 (не менять без обсуждения)
 

@@ -1,4 +1,4 @@
-//! Peer wire protocol (BEP 3): handshake 68 байт + фрейминг сообщений.
+//! Peer wire protocol (`BEP 3`): handshake 68 байт + фрейминг сообщений.
 //!
 //! Каждое сообщение — 4-байтный big-endian префикс длины (покрывает ID и
 //! payload, но не сам префикс), затем байт ID и payload. Длина 0 — keep-alive.
@@ -25,12 +25,21 @@ pub const MAX_MESSAGE_LEN: u32 = 1 << 20;
 /// на больших запросах.
 pub const MAX_BLOCK_LEN: u32 = 16 * 1024;
 
-/// Handshake (BEP 3): 68 байт фиксированной длины.
+/// Бит поддержки extension protocol (`BEP 10`) в поле `reserved` handshake:
+/// `reserved[5] |= EXTENSION_PROTOCOL_BIT` (20-й бит справа).
+pub const EXTENSION_PROTOCOL_BIT: u8 = 0x10;
+
+/// Extended message ID самого extension handshake (`BEP 10`) — фиксированный;
+/// id остальных расширений объявляются динамически в handshake пира.
+pub const EXTENDED_HANDSHAKE_ID: u8 = 0;
+
+/// Handshake (`BEP 3`): 68 байт фиксированной длины.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Handshake {
-    /// 8 reserved bytes; для этого этапа — нули (биты расширений — этапы 5–6).
+    /// 8 reserved bytes; бит extension protocol —
+    /// [`EXTENSION_PROTOCOL_BIT`] в `reserved[5]`.
     pub reserved: [u8; 8],
-    /// SHA-1 словаря `info` — определяет сворм.
+    /// `SHA-1` словаря `info` — определяет сворм.
     pub info_hash: [u8; 20],
     /// ID пира, 20 байт.
     pub peer_id: [u8; 20],
@@ -86,11 +95,22 @@ pub enum PeerMessage {
         /// Длина блока, байт.
         length: u32,
     },
-    /// ID 9: слушающий UDP-порт пира для DHT (актуально с этапа 5).
+    /// ID 9: слушающий UDP-порт пира для `DHT` (актуально с этапа 5).
     Port(
         /// UDP-порт.
         u16,
     ),
+    /// ID 20: extended message (`BEP 10`). Первый байт payload — extended
+    /// message id (0 — handshake расширений), остаток — тело расширения
+    /// (обычно bencoded словарь; у `ut_metadata` data — словарь + сырые байты
+    /// куска метаданных без разделителя).
+    Extended {
+        /// Локальный numeric id расширения: 0 — handshake, остальные — из
+        /// словаря `m` handshake пира (не фиксированы!).
+        ext_id: u8,
+        /// Тело сообщения после байта `ext_id`.
+        payload: Vec<u8>,
+    },
 }
 
 /// Ошибка peer-wire протокола.
@@ -116,7 +136,7 @@ pub enum PeerWireError {
     /// Префикс длины превышает [`MAX_MESSAGE_LEN`].
     #[error("message too large: {0} bytes (max {})", MAX_MESSAGE_LEN)]
     MessageTooLarge(u32),
-    /// ID сообщения не входит в известный набор BEP 3.
+    /// ID сообщения не входит в известный набор `BEP 3`.
     #[error("unknown message id: {0}")]
     UnknownMessage(u8),
     /// Payload сообщения неожиданной длины или не того вида.
@@ -278,6 +298,15 @@ pub async fn read_message(
                 .map_err(|_| PeerWireError::InvalidField("port payload"))?;
             Ok(PeerMessage::Port(u16::from_be_bytes(bytes)))
         }
+        20 => {
+            let Some(&ext_id) = payload.first() else {
+                return Err(PeerWireError::InvalidField("extended message payload"));
+            };
+            Ok(PeerMessage::Extended {
+                ext_id,
+                payload: payload[1..].to_vec(),
+            })
+        }
         other => Err(PeerWireError::UnknownMessage(other)),
     }
 }
@@ -296,6 +325,7 @@ impl PeerMessage {
             PeerMessage::Piece { .. } => Some(7),
             PeerMessage::Cancel { .. } => Some(8),
             PeerMessage::Port(_) => Some(9),
+            PeerMessage::Extended { .. } => Some(20),
         }
     }
 
@@ -336,6 +366,12 @@ impl PeerMessage {
                 out
             }
             PeerMessage::Port(port) => port.to_be_bytes().to_vec(),
+            PeerMessage::Extended { ext_id, payload } => {
+                let mut out = Vec::with_capacity(1 + payload.len());
+                out.push(*ext_id);
+                out.extend_from_slice(payload);
+                out
+            }
         }
     }
 }

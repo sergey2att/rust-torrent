@@ -1,5 +1,5 @@
 //! Engine: менеджер кусков, дисковый слой и оркестрация многопировой
-//! сессии — скачивание и раздача (этапы 3–4).
+//! сессии — скачивание и раздача (этапы 3–5).
 //!
 //! Архитектура — актор на mpsc (см. `GRILL-ME-stage3.md`, `GRILL-ME-stage4.md`):
 //! - хаб владеет [`PieceManager`] и раздаёт блоки пирам;
@@ -14,6 +14,8 @@
 //! `PeerHandle = SocketAddr`; `next_block_request` принимает `peer_id` и ведёт
 //! in-flight по пирам; `DiskStorage::write_piece` пишет кусок целиком после
 //! in-memory verify; `download_block` из peer-wire удалён; endgame в объёме.
+//! Этап 5: `magnet`-сценарий внутри engine ([`Source`]) — `DHT` + трекеры из
+//! `tr=`, фаза метаданных в той же сессии, переиспользование соединений.
 
 mod choke;
 mod piece_manager;
@@ -22,7 +24,10 @@ mod storage;
 
 pub use choke::{ChokeDecision, ChokeManager};
 pub use piece_manager::{BlockRequest, PeerHandle, PieceEvent, PieceManager};
-pub use session::{download, download_with_peers, session, Progress};
+pub use session::{
+    download, download_magnet_with_peers, download_source, download_with_peers, session,
+    session_source, MetadataInfo, Progress, Source,
+};
 pub use storage::DiskStorage;
 
 /// Максимальное число одновременных соединений с пирами.

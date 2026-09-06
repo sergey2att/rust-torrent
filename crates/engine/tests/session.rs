@@ -168,6 +168,7 @@ fn test_torrent(piece_length: u64, total: u64) -> (metainfo::TorrentFile, Vec<Ve
             mode: FileMode::Single { length: total },
         },
         info_hash: INFO_HASH,
+        info_bytes: Vec::new(),
         comment: None,
         created_by: None,
     };
