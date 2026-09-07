@@ -4,7 +4,11 @@
 use crate::EngineError;
 use metainfo::{FileMode, Info};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+#[cfg(not(unix))]
+use std::io::Read;
+use std::io::{Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::fs::FileExt as _;
 use std::path::{Path, PathBuf};
 
 /// Открытый файл с его диапазоном в общем байтовом пространстве торрента.
@@ -170,8 +174,19 @@ impl DiskStorage {
             }
             let buf_from = usize::try_from(from - start).unwrap_or(0);
             let buf_to = usize::try_from(to - start).unwrap_or(0);
-            (&slice.file).seek(SeekFrom::Start(from - slice.offset))?;
-            (&slice.file).read_exact(&mut out[buf_from..buf_to])?;
+            // Позиционное чтение (pread): без общего seek-курсора — безопасно
+            // для конкурентных чтений из нескольких потоков (параллельный
+            // recheck). На не-unix — seek+read под тем же интерфейсом (там
+            // параллельный recheck не используется).
+            #[cfg(unix)]
+            slice
+                .file
+                .read_exact_at(&mut out[buf_from..buf_to], from - slice.offset)?;
+            #[cfg(not(unix))]
+            {
+                (&slice.file).seek(SeekFrom::Start(from - slice.offset))?;
+                (&slice.file).read_exact(&mut out[buf_from..buf_to])?;
+            }
         }
         Ok(out)
     }

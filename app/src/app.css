@@ -1,0 +1,104 @@
+/* Тёмная тема в духе getquin: чёрный фон, карточки #212122, радиус 4px,
+   вторичный текст #999, плюс #5bc87c / минус #ef5343, акцент #6a80ff,
+   основная кнопка — белая с чёрным текстом. */
+:root {
+  --bg: #1a1a1a;
+  --bg-panel: #212122;
+  --bg-hover: #2b2b2c;
+  --border: #2b2b2c;
+  --text: #ffffff;
+  --text-dim: #999999;
+  --text-faint: #787777;
+  --accent: #6a80ff;
+  --accent-deep: #253bbd;
+  --green: #5bc87c;
+  --red: #ef5343;
+  --yellow: #e0b64f;
+  --purple: #a08df5;
+  --radius: 4px;
+  --row-grid: minmax(0, 1fr) 130px 190px 92px 92px 64px;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  user-select: none;
+}
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+button:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Основное действие — белая плашка с чёрным текстом (как у getquin). */
+button.primary {
+  background: var(--text);
+  border-color: var(--text);
+  color: #000000;
+  font-weight: 700;
+}
+
+button.primary:hover:not(:disabled) {
+  background: #e6e6e6;
+  border-color: #e6e6e6;
+}
+
+input[type="text"] {
+  font: inherit;
+  color: var(--text);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px 10px;
+  outline: none;
+  user-select: text;
+}
+
+input[type="text"]:focus {
+  border-color: var(--accent);
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}

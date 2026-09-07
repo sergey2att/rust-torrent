@@ -268,6 +268,22 @@ impl PieceManager {
         }
     }
 
+    /// Упакованные состояния кусков: 2 бита на кусок (00 — отсутствует,
+    /// 01 — в работе, 10 — скачан и проверен), биты младшие вперёд.
+    /// Для Transmission-бара в UI: распределение кусков нагляднее процента.
+    pub fn packed_states(&self) -> Vec<u8> {
+        let mut out = vec![0u8; self.states.len().div_ceil(4)];
+        for (i, st) in self.states.iter().enumerate() {
+            let code = match st {
+                PieceState::Missing => 0u8,
+                PieceState::Progress(_) => 1,
+                PieceState::Done => 2,
+            };
+            out[i / 4] |= code << ((i % 4) * 2);
+        }
+        out
+    }
+
     /// Сколько кусков скачано и проверено.
     pub fn completed_pieces(&self) -> usize {
         self.done_count

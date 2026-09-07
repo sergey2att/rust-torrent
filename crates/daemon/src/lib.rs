@@ -153,9 +153,9 @@ pub(crate) struct Entry {
     pub(crate) torrent_file: Option<String>,
     /// Magnet-строка (magnet-источник).
     pub(crate) magnet: Option<String>,
-    /// Кумулятивные счётчики прошлого тика (скорости — дельты).
-    pub(crate) prev_downloaded: u64,
-    pub(crate) prev_uploaded: u64,
+    /// Оценщики скорости (скользящее окно дельт).
+    pub(crate) down_speed: status::SpeedEstimator,
+    pub(crate) up_speed: status::SpeedEstimator,
     pub(crate) download_speed_bps: u64,
     pub(crate) upload_speed_bps: u64,
 }
@@ -585,8 +585,8 @@ impl DaemonState {
             data_root,
             torrent_file,
             magnet,
-            prev_downloaded: 0,
-            prev_uploaded: 0,
+            down_speed: status::SpeedEstimator::new(),
+            up_speed: status::SpeedEstimator::new(),
             download_speed_bps: 0,
             upload_speed_bps: 0,
         };
@@ -748,16 +748,8 @@ impl DaemonState {
             .filter(|entry| !entry.ended) // статичные состояния (Error) спамить незачем
             .map(|entry| {
                 if let Some(progress) = &entry.progress {
-                    entry.download_speed_bps = status::speed_bps(
-                        progress.downloaded_bytes,
-                        &mut entry.prev_downloaded,
-                        status::STATUS_TICK,
-                    );
-                    entry.upload_speed_bps = status::speed_bps(
-                        progress.uploaded_bytes,
-                        &mut entry.prev_uploaded,
-                        status::STATUS_TICK,
-                    );
+                    entry.download_speed_bps = entry.down_speed.update(progress.downloaded_bytes);
+                    entry.upload_speed_bps = entry.up_speed.update(progress.uploaded_bytes);
                 }
                 status::status_of(entry)
             })

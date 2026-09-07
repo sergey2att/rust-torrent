@@ -17,6 +17,8 @@ fastrand.workspace = true
 tracing = "0.1"
 tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt"] }
 
+rayon = "1"
+
 [dev-dependencies]
 bencode = { path = "../bencode" }
 tempfile = "3"

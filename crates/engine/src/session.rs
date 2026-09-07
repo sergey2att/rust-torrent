@@ -24,6 +24,7 @@ use peer_wire::{
     accept_handshake, perform_handshake, read_message, write_message, Bitfield, Handshake,
     PeerMessage, PeerWireError, EXTENDED_HANDSHAKE_ID,
 };
+use rayon::prelude::*;
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -63,6 +64,10 @@ const NUMWANT: u32 = 50;
 
 /// Период пересмотра choking.
 const CHOKE_PERIOD: Duration = Duration::from_secs(10);
+
+/// Период повторного DHT-анонса (`announce_peer`) в фазе раздачи: записи в
+/// чужих таблицах живут ~30 минут, повторяем чаще.
+const DHT_SEED_ANNOUNCE_PERIOD: Duration = Duration::from_secs(600);
 
 /// Ускоренный PEX-интервал для тестового шва [`session_test`]: ~2 flush'а
 /// укладываются в таймаут теста (в проде — [`ext_pex::PEX_INTERVAL`] = 60 с).
@@ -201,12 +206,17 @@ pub struct Progress {
     pub downloaded_bytes: u64,
     /// Отдано другим пирам байт.
     pub uploaded_bytes: u64,
+    /// Полный размер торрента (0 — метаданные не получены).
+    pub total_bytes: u64,
     /// Активных соединений с пирами.
     pub connected_peers: usize,
     /// Идёт recheck при старте сессии: (проверено, всего).
     pub rechecking: Option<(usize, usize)>,
     /// Верифицированные метаданные (`magnet`-фаза) — приходит один раз.
     pub metadata: Option<MetadataInfo>,
+    /// Упакованные состояния кусков (2 бита на кусок, см.
+    /// `PieceManager::packed_states`); None — состояний нет (речек/magnet).
+    pub piece_states: Option<Vec<u8>>,
 }
 
 /// Команда хаба peer-задаче.
@@ -815,6 +825,8 @@ pub async fn run_session(
         announce_actors,
         announce_next: None,
         dht: dht_client,
+        announce_port,
+        dht_announce_deadline: None,
         local_port,
         nat: nat_mapping,
         info_hash,
@@ -855,16 +867,10 @@ pub async fn run_session(
     // Teardown выполняется и при ошибке цикла: соединения/актор/диск убираются всегда.
     let session_result = session_loop(&mut hub, &mut event_rx, seed, pex_interval, commands).await;
     if matches!(session_result, Ok(true)) {
+        // Несидируемая сессия завершается сразу: финальный анонс `Completed`
+        // трекерам. DHT-анонс здесь не нужен: раздача не начиналась
+        // (сидирующая сессия анонсируется в `enter_seed_mode`).
         hub.send_announce(Some(Event::Completed));
-        // `DHT`-анонс: заявляем себя в рой (best-effort, в фоне).
-        if let Some(client) = hub.dht.clone() {
-            let port = announce_port;
-            tokio::spawn(async move {
-                if let Err(err) = client.announce(info_hash, port).await {
-                    tracing::debug!(%err, "dht announce failed");
-                }
-            });
-        }
     }
     let paths = std::mem::take(&mut hub.paths);
     let teardown_result = teardown_session(hub, dht_forward_task, accept_task, nat_task).await;
@@ -877,6 +883,11 @@ pub async fn run_session(
 
 /// Запускает recheck диска в отдельной задаче: per-piece события + `RecheckDone`
 /// с хранилищем для задачи-писателя.
+///
+/// Хэширование параллельно (rayon, потоков по числу ядер): одиночный SHA-1 —
+/// 1–2 ГБ/с, многогигабайтные торренты на одном потоке проверялись минутами.
+/// События шлются батчами — прогресс UI обновляется на каждом батче, а не
+/// только в конце.
 fn spawn_recheck(
     info: &metainfo::Info,
     storage: DiskStorage,
@@ -884,17 +895,31 @@ fn spawn_recheck(
 ) {
     let hashes = info.pieces.clone();
     tokio::task::spawn_blocking(move || {
-        for (index, expected) in hashes.iter().enumerate() {
-            let index = u32::try_from(index).unwrap_or(u32::MAX);
-            let verified = storage
-                .read_piece(index)
-                .is_ok_and(|data| Sha1::digest(&data)[..] == expected[..]);
+        const BATCH: usize = 64;
+        for (batch_start, batch) in hashes.chunks(BATCH).enumerate() {
+            let base = batch_start * BATCH;
+            let verified: Vec<bool> = batch
+                .par_iter()
+                .enumerate()
+                .map(|(offset, expected)| {
+                    let index = u32::try_from(base + offset).unwrap_or(u32::MAX);
+                    storage
+                        .read_piece(index)
+                        .is_ok_and(|data| Sha1::digest(&data)[..] == expected[..])
+                })
+                .collect();
             // Ошибка чтения = куска нет: сессия перекачает его в фазе скачивания.
-            if event_tx
-                .send(HubEvent::Recheck { index, verified })
-                .is_err()
-            {
-                break; // хаб завершился — recheck больше не нужен
+            for (offset, ok) in verified.into_iter().enumerate() {
+                let index = u32::try_from(base + offset).unwrap_or(u32::MAX);
+                if event_tx
+                    .send(HubEvent::Recheck {
+                        index,
+                        verified: ok,
+                    })
+                    .is_err()
+                {
+                    return; // хаб завершился — recheck больше не нужен
+                }
             }
         }
         // Хранилище возвращается хабу: после этого можно писать и читать блоки.
@@ -950,6 +975,10 @@ async fn session_loop(
                     hub.send_announce(Some(Event::Completed));
                     if seed {
                         hub.phase = Phase::Seed; // idle-таймер выключается фазой
+                        hub.enter_seed_mode();
+                        // Очередь пиров, скопившаяся при докачке: в раздаче
+                        // тоже дозваниваемся (личеры запросят данные).
+                        hub.spawn_from_queue();
                     } else {
                         break true;
                     }
@@ -973,6 +1002,7 @@ async fn session_loop(
             if matches!(hub.phase, Phase::Download | Phase::Metadata) && !hub.paused =>
                 return Err(EngineError::IdleTimeout),
         }
+        hub.on_periodic_tick();
         if let Some(delay) = hub.announce_next.take() {
             announce_deadline = Some(tokio::time::Instant::now() + delay);
         }
@@ -1300,6 +1330,11 @@ struct Hub {
     announce_next: Option<Duration>,
     /// `DHT`-клиент (только `magnet`-сценарий).
     dht: Option<dht::DhtClient>,
+    /// Порт, объявляемый пирам (внешний при NAT, иначе локальный) — для
+    /// DHT `announce_peer` в фазе раздачи.
+    announce_port: u16,
+    /// Дедлайн следующего DHT-анонса раздачи (фаза Seed).
+    dht_announce_deadline: Option<tokio::time::Instant>,
     /// Локальный TCP-порт слушателя (для фильтрации собственного адреса).
     local_port: u16,
     /// UPnP-маппинг, если удался (внешний адрес для фильтрации себя в PEX).
@@ -1536,7 +1571,7 @@ impl Hub {
                 self.enqueue(addr);
             }
         }
-        if matches!(self.phase, Phase::Download | Phase::Metadata) {
+        if self.phase != Phase::Recheck {
             self.spawn_from_queue();
         }
         tracing::debug!(
@@ -1725,8 +1760,11 @@ impl Hub {
                 // (в `magnet`-фазе до этого нечего было отправлять).
                 self.initialize_peers_for_download();
                 // Очередь могла наполниться от первого анонса во время recheck.
-                if self.phase == Phase::Download {
+                if self.phase != Phase::Recheck {
                     self.spawn_from_queue();
+                }
+                if self.phase == Phase::Seed {
+                    self.enter_seed_mode();
                 }
                 self.emit_progress();
                 // Без раздачи полные с старта данные — сразу конец сессии.
@@ -1739,8 +1777,9 @@ impl Hub {
                         for addr in response.peers {
                             self.enqueue(addr);
                         }
-                        // К пиру подключаемся, пока качаем; сидер принимает входящие.
-                        if matches!(self.phase, Phase::Download | Phase::Metadata) {
+                        // К пиру подключаемся и в раздаче: среди найденных
+                        // есть личеры — увидят наш полный битфилд и запросят.
+                        if self.phase != Phase::Recheck {
                             self.spawn_from_queue();
                         }
                     }
@@ -1756,8 +1795,9 @@ impl Hub {
                 for addr in peers {
                     self.enqueue(addr);
                 }
-                // Ищем пиров и в `magnet`-фазе (для метаданных), и при скачивании.
-                if matches!(self.phase, Phase::Download | Phase::Metadata) {
+                // Ищем пиров и в `magnet`-фазе (для метаданных), при скачивании
+                // и в раздаче (личеры из DHT — кому отдавать).
+                if self.phase != Phase::Recheck {
                     self.spawn_from_queue();
                 }
                 self.emit_progress();
@@ -1777,6 +1817,25 @@ impl Hub {
         match event {
             PeerEvent::InboundConnected { handle, stream } => {
                 if self.peers.len() < MAX_CONNECTIONS && !self.peers.contains_key(&handle) {
+                    self.register_inbound(handle, stream);
+                } else if !self.peers.contains_key(&handle) {
+                    // Пул полон: вытесняем бесполезного пира — сид (полный
+                    // битфилд) и не интересуется (нам отдавать нечего ему, а
+                    // нам от него нечего качать). Иначе сидирующая сессия
+                    // навсегда забита сидами и личеры не могут подключиться
+                    // (как у Transmission: бесполезные соединения заменяются).
+                    let Some(victim) = self
+                        .peers
+                        .iter()
+                        .find(|(_, link)| link.bitfield.is_full() && !link.interested)
+                        .map(|(h, _)| *h)
+                    else {
+                        return; // все полезны — нового не берём
+                    };
+                    tracing::debug!(peer = %victim, "evicting useless seed peer for newcomer");
+                    self.disconnect(victim);
+                    // Слот освобождается асинхронно (по Disconnected от жертвы),
+                    // новичка регистрируем сразу: временный перевес на 1 — норма.
                     self.register_inbound(handle, stream);
                 }
                 // Иначе соединение тихо закрывается (поток дропается).
@@ -2217,6 +2276,43 @@ impl Hub {
         }
     }
 
+    /// Вход в режим раздачи: заявляем себя в DHT-рой (`announce_peer`) и
+    /// повторяем периодически. Без этого сидер невидим для DHT-личеров:
+    /// `find_peers` только читает чужие списки, себя мы не объявляем —
+    /// прежний DHT-анонс был только после конца сессии, при teardown.
+    fn enter_seed_mode(&mut self) {
+        self.spawn_dht_announce();
+        self.dht_announce_deadline = Some(tokio::time::Instant::now() + DHT_SEED_ANNOUNCE_PERIOD);
+    }
+
+    /// `announce_peer` в фоне: полный lookup — десятки секунд, хабу не мешает.
+    fn spawn_dht_announce(&self) {
+        if let Some(client) = self.dht.clone() {
+            let port = self.announce_port;
+            let info_hash = self.info_hash;
+            tokio::spawn(async move {
+                if let Err(err) = client.announce(info_hash, port).await {
+                    tracing::debug!(%err, "dht seed announce failed");
+                }
+            });
+        }
+    }
+
+    /// Периодический тик (на таймере choking, 10 с): пора ли повторять
+    /// DHT-анонс раздачи.
+    fn on_periodic_tick(&mut self) {
+        if self.phase != Phase::Seed {
+            return;
+        }
+        if let Some(deadline) = self.dht_announce_deadline {
+            if tokio::time::Instant::now() >= deadline {
+                self.spawn_dht_announce();
+                self.dht_announce_deadline =
+                    Some(tokio::time::Instant::now() + DHT_SEED_ANNOUNCE_PERIOD);
+            }
+        }
+    }
+
     /// Пересматривает choking: окно round-robin по заинтересованным пирам,
     /// diff (Unchoke/Choke) уходит пирам.
     fn recompute_chokes(&mut self) {
@@ -2364,9 +2460,11 @@ impl Hub {
                 total_pieces: self.piece_count,
                 downloaded_bytes: self.downloaded_bytes,
                 uploaded_bytes: self.uploaded_bytes,
+                total_bytes: self.total_length,
                 connected_peers: self.peers.len(),
                 rechecking,
                 metadata: self.metadata_info.clone(),
+                piece_states: self.pm.as_ref().map(PieceManager::packed_states),
             });
         }
     }
@@ -2444,6 +2542,26 @@ async fn disk_writer(
 // Аргументы peer_task зеркалят поверхность протокола (пир/режим/состояние
 // хендшейка + каналы); группировка в структуру добавила бы прокладку на два
 // вызова, поэтому допускаем 10 параметров явно.
+/// Исходящий дозвон: connect + handshake (с таймаутом) — только наш reserved
+/// с битом расширений, тот же, что объявляем во входящих.
+async fn dial_peer(
+    handle: PeerHandle,
+    info_hash: [u8; 20],
+    our_peer_id: [u8; 20],
+) -> Result<TcpStream, PeerWireError> {
+    tokio::time::timeout(CONNECT_TIMEOUT, async {
+        let mut stream = TcpStream::connect(handle).await?;
+        let ours = Handshake {
+            reserved: ext_metadata::reserved_with_extensions(),
+            info_hash,
+            peer_id: our_peer_id,
+        };
+        perform_handshake(&mut stream, &ours, info_hash).await?;
+        Ok(stream)
+    })
+    .await?
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn peer_task(
     handle: PeerHandle,
@@ -2468,25 +2586,14 @@ async fn peer_task(
             };
             stream
         }
-        PeerMode::Outbound => {
-            let connect = tokio::time::timeout(CONNECT_TIMEOUT, async {
-                let mut stream = TcpStream::connect(handle).await?;
-                let ours = Handshake {
-                    reserved: ext_metadata::reserved_with_extensions(),
-                    info_hash,
-                    peer_id: our_peer_id,
-                };
-                perform_handshake(&mut stream, &ours, info_hash).await?;
-                Ok::<_, PeerWireError>(stream)
-            })
-            .await;
-            let Ok(Ok(stream)) = connect else {
-                tracing::debug!(peer = %handle, "connect/handshake failed");
+        PeerMode::Outbound => match dial_peer(handle, info_hash, our_peer_id).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                tracing::debug!(peer = %handle, %err, "connect/handshake failed");
                 notify(PeerEvent::Disconnected { handle });
                 return;
-            };
-            stream
-        }
+            }
+        },
     };
     // Сразу после handshake: объявляем поддержку расширений (`BEP 10`), свои
     // куски и интерес — дальше их не шлём.

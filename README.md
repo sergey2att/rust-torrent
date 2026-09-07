@@ -15,6 +15,7 @@ BitTorrent-клиент на Rust. Бесплатный, целевая плат
 | ✅ 5 | DHT (BEP 5), magnet-ссылки, extension protocol (BEP 10) + ut_metadata (BEP 9) |
 | ✅ 6 | ut_pex (BEP 11), UPnP-проброс порта, полировка peer-wire |
 | ✅ 7 | Многоторрентный daemon: реестр, accept-роутер, общий DHT, пауза in-place, персистентность списка + узлов DHT |
+| 🔶 8 | Tauri-приложение (macOS): тёмный UI в стиле getquin, таблица торрентов, Transmission-бар кусков, ETA, уведомления |
 
 ## Что уже работает
 
@@ -34,7 +35,16 @@ choking — round-robin + optimistic-слот. Диски пишутся отд�
 info_hash, один общий DHT-клиент и NAT-маппинг, пауза/резюм in-place без recheck,
 персистентный список торрентов в app-data. Routing table DHT персистится между
 запусками — тёплый старт: первые пиры через секунды, а не после минутного холодного
-обхода. UI (Tauri, этап 8) строится поверх `DaemonHandle`.
+обхода. Сидер дозванивается до пиров из анонсов и анонсируется в DHT, пока раздаёт;
+вытесняет бесполезные сиды из полного пула, впуская личеров (как в Transmission).
+
+**UI (этап 8)**: Tauri v2 — системный WKWebView, без Xcode (достаточно CLT). Тёмная тема
+в духе getquin, таблица торрентов во всю ширину окна, прогресс-бар по кускам как в
+Transmission (per-piece состояния приходят из движка упакованными по 2 бита), ETA,
+тоталы, плавные скорости с удержанием нуля, drag-and-drop .torrent, magnet-строка,
+пауза/резюм/удаление, системные уведомления о завершении. Крестик окно закрывает,
+но раздача продолжает работать в фоне (нативное поведение macOS); выход — Cmd+Q
+(анонсы `Stopped`, NAT unmap, чистое завершение процесса).
 
 Приёмка: Debian 13.6 netinst (755 МБ) качается по `.torrent` через трекеры и по magnet без
 трекеров (чистый DHT) — в обоих случаях SHA-256 совпадает с официальным; в изолированном
@@ -48,6 +58,9 @@ cargo run --release -- <file.torrent | magnet:?> <download_dir> [port] [--no-see
 cargo test                                             # офлайн-тесты
 cargo test -p cli -- --ignored                         # ручной smoke: реальные трекеры, DHT-рой, magnet-приёмка
 RUST_LOG=engine=debug cargo run --release -- ...       # трассировка движка (по умолчанию — только ERROR)
+
+# UI-приложение (этап 8, macOS):
+cd app && npm install && npm run tauri dev             # dev-режим
 ```
 
 Пример magnet-скачивания (кавычки обязательны — в URL есть `&`):
@@ -71,6 +84,7 @@ cargo run --release -- "magnet:?xt=urn:btih:<40-hex>&tr=<announce-url>" ~/Downlo
 | `engine` | менеджер кусков (rarest-first, endgame), дисковый слой, сессия: скачивание + раздача + magnet-фаза (актор на mpsc), choking |
 | `daemon` | многоторрентный оркестратор: реестр, accept-роутер по info_hash, общий DHT, персистентность списка и узлов DHT, статусы для UI |
 | `cli` | сквозная проверка этапов: `.torrent` или magnet, автоопределение по префиксу |
+| `app/` | Tauri v2 UI (Svelte 5): таблица торрентов, Transmission-бар кусков, темная тема getquin |
 
 Библиотечные крейты без `unwrap`/`expect` (enforced линтами), без `unsafe`,
 типизированные ошибки через `thiserror`.

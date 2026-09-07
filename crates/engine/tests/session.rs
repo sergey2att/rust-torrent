@@ -8,7 +8,7 @@
     clippy::cast_lossless
 )] // тесты вправе паниковать
 
-use engine::{download_with_peers, PeerHandle, Progress, SessionCommand};
+use engine::{download_with_peers, PeerHandle, Progress, SessionCommand, Source, MAX_CONNECTIONS};
 use metainfo::{FileMode, Info};
 use peer_wire::{read_message, write_message, PeerMessage, HANDSHAKE_LEN};
 use sha1::{Digest, Sha1};
@@ -374,6 +374,158 @@ async fn seeder_serves_full_torrent_to_leecher() {
     );
 }
 
+/// Mock-трекер: на каждый анонс отвечает компакт-адресом `peer`
+/// (bencode `d8:intervali1e5:peers<6 байт>e`).
+async fn spawn_mock_tracker(peer: std::net::SocketAddr) -> std::net::SocketAddr {
+    let std::net::IpAddr::V4(ip) = peer.ip() else {
+        panic!("тест рассчитан на IPv4");
+    };
+    let compact: Vec<u8> = ip
+        .octets()
+        .into_iter()
+        .chain(peer.port().to_be_bytes())
+        .collect();
+    let mut body = Vec::new();
+    body.extend_from_slice(b"d8:intervali1e5:peers");
+    body.extend_from_slice(compact.len().to_string().as_bytes());
+    body.push(b':');
+    body.extend_from_slice(&compact);
+    body.extend_from_slice(b"e");
+    let tracker = std::sync::Arc::new(body);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut conn, _)) = listener.accept().await else {
+                return;
+            };
+            let body = tracker.clone();
+            tokio::spawn(async move {
+                let mut req = [0u8; 1024];
+                let _ = conn.read(&mut req).await;
+                let mut resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                )
+                .into_bytes();
+                resp.extend_from_slice(&body);
+                let _ = conn.write_all(&resp).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Фейковый личер: принимает ИСХОДЯЩЕЕ соединение, объявляет interested,
+/// запрашивает кусок 0 и возвращает полученный блок.
+async fn accept_outbound_leecher(listener: TcpListener) -> Vec<u8> {
+    let (mut conn, _) = listener
+        .accept()
+        .await
+        .expect("сидер не дозвонился в Seed-фазе");
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    conn.read_exact(&mut buf).await.unwrap();
+    let mut reply = Vec::with_capacity(HANDSHAKE_LEN);
+    reply.push(19);
+    reply.extend_from_slice(b"BitTorrent protocol");
+    reply.extend_from_slice(&[0u8; 8]);
+    reply.extend_from_slice(&INFO_HASH);
+    reply.extend_from_slice(&[3u8; 20]);
+    conn.write_all(&reply).await.unwrap();
+    conn.flush().await.unwrap();
+    write_message(&mut conn, &PeerMessage::Interested)
+        .await
+        .unwrap();
+
+    // Сообщения до unchoke (bitfield/keep-alive — порядок не гарантируем,
+    // битфилд сидера прилетает после первого interested-события).
+    loop {
+        let msg = read_message(&mut conn).await.unwrap();
+        if matches!(msg, PeerMessage::Unchoke) {
+            break;
+        }
+    }
+    write_message(
+        &mut conn,
+        &PeerMessage::Request {
+            index: 0,
+            begin: 0,
+            length: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    loop {
+        let msg = read_message(&mut conn).await.unwrap();
+        if let PeerMessage::Piece {
+            index,
+            begin,
+            block,
+        } = msg
+        {
+            assert_eq!((index, begin), (0, 0));
+            return block;
+        }
+    }
+}
+
+/// Сидирующая сессия дозванивается до пиров, выученных из анонса трекера,
+/// будучи в Seed-фазе (баг: гейт Seed-фазы отсекал исходящие дозвоны — сидер
+/// был пассивен, uploaded = 0 для трекер/DHT-личеров). Mock-трекер отдаёт
+/// адрес личера; сидер обязан сам к нему подключиться и отдать кусок.
+#[tokio::test]
+async fn seeding_session_dials_out_to_peer_from_tracker_announce() {
+    let (mut torrent, pieces) = test_torrent(1024, 2 * 1024);
+    let expected: Vec<u8> = pieces.iter().flatten().copied().collect();
+
+    // Личер слушает; трекер знает его адрес.
+    let leecher = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let leecher_addr = leecher.local_addr().unwrap();
+    let tracker_addr = spawn_mock_tracker(leecher_addr).await;
+    torrent.announce = Some(format!("http://{tracker_addr}/announce"));
+
+    // Данные сидера уже на диске; сессия в seed-режиме, пиров не знаем —
+    // только трекер.
+    let seed_dir = tempfile::tempdir().unwrap();
+    std::fs::write(seed_dir.path().join("test-dl"), &expected).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let served_piece = tokio::spawn(accept_outbound_leecher(leecher));
+
+    let (stop_tx, stop_rx) = mpsc::channel::<SessionCommand>(1);
+    let seed_data_path = seed_dir.path().join("test-dl");
+    let session = tokio::spawn(async move {
+        let paths = engine::session_test(
+            Source::Torrent(torrent),
+            seed_dir.path(),
+            listener,
+            Vec::new(),
+            Vec::new(), // пиров не знаем заранее — только из анонса трекера
+            None,
+            true,
+            stop_rx,
+        )
+        .await;
+        // TempDir возвращаем вместе с результатом: живёт, пока жива сессия.
+        (paths, seed_dir)
+    });
+
+    // Кусок 0 отдан ровно тот, что на диске: отдача пошла по исходящему соединению.
+    let block = tokio::time::timeout(Duration::from_secs(30), served_piece)
+        .await
+        .expect("отдача по исходящему соединению зависла — сидер не дозвонился")
+        .unwrap();
+    assert_eq!(block, pieces[0]);
+
+    stop_tx.send(SessionCommand::Shutdown).await.unwrap();
+    let paths = tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .expect("сидирующая сессия не остановилась")
+        .unwrap()
+        .0
+        .expect("сидирующая сессия не удалась");
+    assert_eq!(paths, vec![seed_data_path]);
+}
+
 /// Request с мусорным диапазоном (длина 0 / выход за кусок) — недоверенный
 /// ввод: сидер разрывает соединение, а не отдаёт мусор.
 #[tokio::test]
@@ -433,4 +585,130 @@ async fn seeder_closes_connection_on_garbage_request() {
         result.is_ok(),
         "сидер обязан разорвать соединение за мусорный request"
     );
+}
+
+/// Фейковый «бесполезный сид»: handshake → полный битфилд → молчание (не
+/// интересуется). Ждёт закрытия; закрытие = вытеснен из пула.
+async fn spawn_useless_seed_peer(
+    connected: Arc<AtomicUsize>,
+    dropped: Arc<AtomicUsize>,
+) -> PeerHandle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut conn, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; HANDSHAKE_LEN];
+        conn.read_exact(&mut buf).await.unwrap();
+        let mut reply = Vec::with_capacity(HANDSHAKE_LEN);
+        reply.push(19);
+        reply.extend_from_slice(b"BitTorrent protocol");
+        reply.extend_from_slice(&[0u8; 8]);
+        reply.extend_from_slice(&INFO_HASH);
+        reply.extend_from_slice(&[8u8; 20]);
+        conn.write_all(&reply).await.unwrap();
+        // Полный битфилд на 2 куска — «сид»: кандидат на вытеснение.
+        write_message(&mut conn, &PeerMessage::Bitfield(vec![0xC0]))
+            .await
+            .unwrap();
+        connected.fetch_add(1, Ordering::SeqCst);
+        let mut sink = [0u8; 64];
+        loop {
+            match conn.read(&mut sink).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+        dropped.fetch_add(1, Ordering::SeqCst);
+    });
+    addr
+}
+
+/// Пул полон бесполезных сидов: входящий новичок вытесняет одного из них и
+/// сам регистрируется (получает наши сообщения), как у Transmission.
+#[tokio::test]
+async fn full_pool_evicts_useless_seed_for_inbound_newcomer() {
+    let (torrent, pieces) = test_torrent(1024, 2 * 1024);
+    let expected: Vec<u8> = pieces.iter().flatten().copied().collect();
+
+    let connected = Arc::new(AtomicUsize::new(0));
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut addrs = Vec::new();
+    for _ in 0..MAX_CONNECTIONS {
+        addrs.push(spawn_useless_seed_peer(connected.clone(), dropped.clone()).await);
+    }
+
+    let seed_dir = tempfile::tempdir().unwrap();
+    std::fs::write(seed_dir.path().join("test-dl"), &expected).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let seeder_addr = listener.local_addr().unwrap();
+    let (_stop_tx, stop_rx) = mpsc::channel::<engine::SessionCommand>(1);
+    let dir = seed_dir.path().to_path_buf();
+    let _session = tokio::spawn(async move {
+        engine::session_test(
+            Source::Torrent(torrent),
+            &dir,
+            listener,
+            Vec::new(),
+            addrs,
+            None,
+            true,
+            stop_rx,
+        )
+        .await
+    });
+
+    // Ждём, пока пул заполнится всеми MAX_CONNECTIONS сидами.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while connected.load(Ordering::SeqCst) < MAX_CONNECTIONS {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "сессия не дозвонилась до всех фейковых сидов"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Слот регистрируется после ответа handshake — даём устаканиться.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Новичок подключается к ПОЛНОМУ пулу.
+    let mut conn = TcpStream::connect(seeder_addr).await.unwrap();
+    let mut hs = Vec::with_capacity(HANDSHAKE_LEN);
+    hs.push(19);
+    hs.extend_from_slice(b"BitTorrent protocol");
+    hs.extend_from_slice(&[0u8; 8]);
+    hs.extend_from_slice(&INFO_HASH);
+    hs.extend_from_slice(&[6u8; 20]);
+    conn.write_all(&hs).await.unwrap();
+    conn.flush().await.unwrap();
+    let mut reply = [0u8; HANDSHAKE_LEN];
+    conn.read_exact(&mut reply).await.unwrap();
+    write_message(&mut conn, &PeerMessage::Interested)
+        .await
+        .unwrap();
+
+    // Вытеснение случилось: новичок зарегистрирован и получает сообщения.
+    let mut registered = false;
+    for _ in 0..5 {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_message(&mut conn))
+            .await
+            .expect("новичок в полном пуле не получил сообщений — вытеснения нет")
+            .expect("битое сообщение от сидера");
+        if matches!(msg, PeerMessage::Extended { .. } | PeerMessage::Bitfield(_)) {
+            registered = true;
+            break;
+        }
+    }
+    assert!(
+        registered,
+        "новичок не зарегистрирован в полном пуле — вытеснение не сработало"
+    );
+
+    // Жертва вытеснена: хотя бы одно соединение закрыто.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while dropped.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "никто из useless-сидов не вытеснен"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
