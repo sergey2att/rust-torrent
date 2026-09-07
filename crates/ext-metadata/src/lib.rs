@@ -47,13 +47,33 @@ pub const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const CLIENT_VERSION: &[u8] = b"RT 1.0";
 
 /// Содержимое extension handshake пира, нужное нам.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Словарь `m` — полный: имена расширений → объявленные пиром локальные id
+/// (0 = не поддерживается); lookup по имени — [`ExtHandshake::extension_id`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ExtHandshake {
-    /// Локальный id `ut_metadata`, объявленный пиром (`m.ut_metadata`);
-    /// `None` — расширение пиром не поддерживается.
-    pub ut_metadata_id: Option<u8>,
+    /// Объявленные пиром расширения (`m`): имя → локальный id.
+    pub m: BTreeMap<Vec<u8>, u8>,
     /// Полный размер метаданных в байтах (`metadata_size`), если объявлен.
     pub metadata_size: Option<u64>,
+}
+
+impl ExtHandshake {
+    /// Локальный id расширения `name`, объявленный пиром; `None` —
+    /// расширение не поддерживается (id 0 или отсутствие в `m`).
+    #[must_use]
+    pub fn extension_id(&self, name: &[u8]) -> Option<u8> {
+        match self.m.get(name) {
+            Some(&id) => (id > 0).then_some(id),
+            None => None,
+        }
+    }
+
+    /// Локальный id `ut_metadata`, объявленный пиром.
+    #[must_use]
+    pub fn ut_metadata_id(&self) -> Option<u8> {
+        self.extension_id(b"ut_metadata")
+    }
 }
 
 /// Сообщение `ut_metadata` (`BEP 9`).
@@ -139,15 +159,18 @@ pub(crate) fn hex_short(hash: [u8; 20]) -> String {
 
 // --- Кодирование/декодирование сообщений ---
 
-/// Кодирует payload extended handshake: `{"m": {"ut_metadata": 1}, "v": ...}`
-/// плюс `metadata_size`, когда метаданные известны.
+/// Кодирует payload extended handshake: `{"m": <extensions>, "v": ...}`
+/// плюс `metadata_size`, когда метаданные известны. Все наши расширения
+/// (`ut_metadata`, `ut_pex`) объявляются вызывающим в `extensions` безусловно.
 #[must_use]
-pub fn encode_ext_handshake(metadata_size: Option<usize>) -> Vec<u8> {
-    let mut m = BTreeMap::new();
-    m.insert(
-        b"ut_metadata".to_vec(),
-        BValue::Int(i64::from(OUR_UT_METADATA_ID)),
-    );
+pub fn encode_ext_handshake(
+    extensions: &BTreeMap<Vec<u8>, u8>,
+    metadata_size: Option<usize>,
+) -> Vec<u8> {
+    let m: BTreeMap<Vec<u8>, BValue> = extensions
+        .iter()
+        .map(|(name, &id)| (name.clone(), BValue::Int(i64::from(id))))
+        .collect();
     let mut dict = BTreeMap::new();
     dict.insert(b"m".to_vec(), BValue::Dict(m));
     dict.insert(b"v".to_vec(), BValue::Bytes(CLIENT_VERSION.to_vec()));
@@ -162,8 +185,7 @@ pub fn encode_ext_handshake(metadata_size: Option<usize>) -> Vec<u8> {
 
 /// Разбирает payload extended handshake пира (после байта `ext_id` = 0).
 ///
-/// Чужие поля игнорируются; интересуют только `m.ut_metadata` и
-/// `metadata_size`.
+/// Чужие поля игнорируются; интересуют словарь `m` и `metadata_size`.
 ///
 /// # Errors
 ///
@@ -173,24 +195,33 @@ pub fn parse_ext_handshake(payload: &[u8]) -> Result<ExtHandshake, ExtError> {
     let BValue::Dict(dict) = value else {
         return Err(ExtError::InvalidField("extended handshake dict"));
     };
-    let ut_metadata_id = match dict.get(b"m".as_slice()) {
-        Some(BValue::Dict(m)) => match m.get(b"ut_metadata".as_slice()) {
-            Some(BValue::Int(id)) => {
-                let id = u8::try_from(*id).map_err(|_| ExtError::InvalidField("m.ut_metadata"))?;
-                (id > 0).then_some(id) // 0 = не поддерживается
-            }
-            _ => None,
-        },
-        _ => None,
-    };
     let metadata_size = match dict.get(b"metadata_size".as_slice()) {
         Some(BValue::Int(size)) => u64::try_from(*size).ok(),
         _ => None,
     };
-    Ok(ExtHandshake {
-        ut_metadata_id,
-        metadata_size,
-    })
+    let hs = match dict.get(b"m".as_slice()) {
+        Some(BValue::Dict(m)) => {
+            let ids: BTreeMap<Vec<u8>, u8> = m
+                .iter()
+                .filter_map(|(name, value)| match value {
+                    BValue::Int(id) => {
+                        let id = u8::try_from(*id).ok()?;
+                        Some((name.clone(), id))
+                    }
+                    _ => None,
+                })
+                .collect();
+            ExtHandshake {
+                m: ids,
+                metadata_size,
+            }
+        }
+        _ => ExtHandshake {
+            m: BTreeMap::new(),
+            metadata_size,
+        },
+    };
+    Ok(hs)
 }
 
 /// Кодирует payload `ut_metadata`-запроса куска: `{"msg_type": 0, "piece": N}`.
@@ -304,7 +335,7 @@ pub async fn fetch_metadata(
         stream,
         &PeerMessage::Extended {
             ext_id: EXTENDED_HANDSHAKE_ID,
-            payload: encode_ext_handshake(None),
+            payload: encode_ext_handshake(&our_extensions(), None),
         },
     )
     .await?;
@@ -320,7 +351,7 @@ pub async fn fetch_metadata(
             continue; // bitfield/keepalive и прочее до ext handshake игнорируем
         };
         let hs = parse_ext_handshake(&payload)?;
-        let Some(id) = hs.ut_metadata_id else {
+        let Some(id) = hs.ut_metadata_id() else {
             return Err(ExtError::NoUtMetadata);
         };
         let Some(size) = hs.metadata_size else {
@@ -392,6 +423,13 @@ pub fn reserved_with_extensions() -> [u8; 8] {
     let mut reserved = [0u8; 8];
     reserved[5] |= EXTENSION_PROTOCOL_BIT;
     reserved
+}
+
+/// Наши расширения для словаря `m` ext handshake (без `ut_pex` — его добавляет
+/// engine, крейту ext-metadata о нём знать не нужно).
+#[must_use]
+pub fn our_extensions() -> BTreeMap<Vec<u8>, u8> {
+    BTreeMap::from([(b"ut_metadata".to_vec(), OUR_UT_METADATA_ID)])
 }
 
 /// Валидирует объявленный размер метаданных.

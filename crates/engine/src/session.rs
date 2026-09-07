@@ -16,6 +16,9 @@ use crate::piece_manager::{PeerHandle, PieceEvent, PieceManager};
 use crate::storage::DiskStorage;
 use crate::{EngineError, MAX_CONNECTIONS};
 use ext_metadata::{MetadataCollector, OUR_UT_METADATA_ID};
+use ext_pex::{
+    PexError, PexPeer, PexUpdate, OUR_UT_PEX_ID, PEER_FLAG_SEED, PEX_INTERVAL, PEX_MIN_INTERVAL,
+};
 use metainfo::{MagnetLink, TorrentFile};
 use peer_wire::{
     accept_handshake, perform_handshake, read_message, write_message, Bitfield, Handshake,
@@ -23,10 +26,10 @@ use peer_wire::{
 };
 use sha1::{Digest, Sha1};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tracker::{AnnounceRequest, AnnounceResponse, Event, TrackerError};
@@ -61,6 +64,10 @@ const NUMWANT: u32 = 50;
 /// Период пересмотра choking.
 const CHOKE_PERIOD: Duration = Duration::from_secs(10);
 
+/// Ускоренный PEX-интервал для тестового шва [`session_test`]: ~2 flush'а
+/// укладываются в таймаут теста (в проде — [`ext_pex::PEX_INTERVAL`] = 60 с).
+const PEX_TEST_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Максимум одновременно разчокнутых пиров.
 const MAX_UNCHOKED: usize = 4;
 
@@ -71,6 +78,12 @@ const MAX_SERVE_BLOCK: u32 = 128 * 1024;
 /// Сколько секунд ждать остановки анонс-актора при завершении сессии
 /// (финальный Stopped-анонс — best-effort, не блокируем выход надолго).
 const ACTOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Период тихого ретрая UPnP-маппинга после неудачи на старте.
+const NAT_RETRY_PERIOD: Duration = Duration::from_secs(600);
+
+/// Сколько секунд ждать unmap при разборке сессии, прежде чем abort.
+const NAT_UNMAP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Публичные bootstrap-узлы `DHT` (`BEP 5`).
 const DHT_BOOTSTRAP_HOSTS: &[&str] = &[
@@ -246,6 +259,56 @@ struct PeerLink {
     collector: Option<MetadataCollector>,
     /// Локальный id `ut_metadata`, объявленный пиром (может не быть 1!).
     peer_ut_id: Option<u8>,
+    /// Локальный id `ut_pex`, объявленный пиром (`None` — PEX не поддерживается).
+    peer_pex_id: Option<u8>,
+    /// Очередь дельт для этого пира (появляется, когда пир объявил `ut_pex`).
+    pex_outbox: Option<PexOutbox>,
+    /// Момент последнего входящего PEX — флуд-контроль.
+    last_pex: Option<Instant>,
+}
+
+/// Per-recipient очередь PEX-дельт (outbox-модель Transmission): хаб —
+/// единственный владелец истины о сворме, peer-задача — тупая труба.
+/// Первый flush новому пиру — полный список сворма (`full_sent = false`),
+/// дальше только дельты.
+#[derive(Default)]
+struct PexOutbox {
+    /// Полный список уже отправлен (дальше только дельты).
+    full_sent: bool,
+    added: Vec<PexPeer>,
+    dropped: Vec<SocketAddrV4>,
+}
+
+impl PexOutbox {
+    /// Новый пир появился в сворме (без дублей).
+    fn add(&mut self, addr: SocketAddrV4) {
+        if !self.added.iter().any(|p| p.addr == addr) {
+            self.added.push(PexPeer { addr, flags: 0 });
+        }
+    }
+
+    /// Пир покинул сворм (без дублей).
+    fn drop_peer(&mut self, addr: SocketAddrV4) {
+        if !self.dropped.contains(&addr) {
+            self.dropped.push(addr);
+        }
+    }
+
+    /// Забирает накопленное.
+    fn drain(&mut self) -> PexUpdate {
+        PexUpdate {
+            added: std::mem::take(&mut self.added),
+            dropped: std::mem::take(&mut self.dropped),
+        }
+    }
+}
+
+/// Сужает адрес до IPv4 (PEX v1 поддерживает только IPv4; `added6` — YAGNI).
+fn peer_v4(addr: SocketAddr) -> Option<SocketAddrV4> {
+    match addr {
+        SocketAddr::V4(v4) => Some(v4),
+        SocketAddr::V6(_) => None,
+    }
 }
 
 /// Фаза сессии: поиск метаданных (`magnet`) → recheck данных → скачивание →
@@ -315,6 +378,7 @@ pub async fn session_source(
         Vec::new(),
         progress,
         true,
+        PEX_INTERVAL,
         shutdown,
     )
     .await
@@ -378,6 +442,7 @@ pub async fn download_source(
         Vec::new(),
         progress,
         false,
+        PEX_INTERVAL,
         shutdown,
     )
     .await
@@ -420,7 +485,7 @@ pub async fn download_magnet_with_peers(
 ) -> Result<Vec<PathBuf>, EngineError> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
     let (_keep_alive, shutdown) = mpsc::channel::<()>(1);
-    run_session(
+    session_test(
         source,
         download_dir,
         listener,
@@ -428,6 +493,35 @@ pub async fn download_magnet_with_peers(
         initial_peers,
         progress,
         false,
+        shutdown,
+    )
+    .await
+}
+
+/// Тестовый шов (этап 6, по образцу `announce_udp_impl(base)`): то же, что
+/// [`download_magnet_with_peers`], но с выбором seed-режима и ускоренным
+/// PEX-интервалом. Скрыт из документации — только для интеграционных тестов.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub async fn session_test(
+    source: Source,
+    download_dir: &Path,
+    listener: TcpListener,
+    dht_bootstrap: Vec<std::net::SocketAddr>,
+    initial_peers: Vec<PeerHandle>,
+    progress: Option<mpsc::UnboundedSender<Progress>>,
+    seed: bool,
+    shutdown: mpsc::Receiver<()>,
+) -> Result<Vec<PathBuf>, EngineError> {
+    run_session(
+        source,
+        download_dir,
+        listener,
+        dht_bootstrap,
+        initial_peers,
+        progress,
+        seed,
+        PEX_TEST_INTERVAL,
         shutdown,
     )
     .await
@@ -445,6 +539,7 @@ async fn run_session(
     initial_peers: Vec<PeerHandle>,
     progress: Option<mpsc::UnboundedSender<Progress>>,
     seed: bool,
+    pex_interval: Duration,
     shutdown: mpsc::Receiver<()>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     let (magnet, torrent) = match source {
@@ -464,8 +559,19 @@ async fn run_session(
     };
     let our_peer_id = tracker::peer_id();
     let session_key = tracker::session_key();
-    let announce_port = listener.local_addr()?.port();
+    let local_port = listener.local_addr()?.port();
     let download_dir = download_dir.to_path_buf();
+
+    // UPnP-маппинг до анонс-акторов: успех → внешний порт в анонсах/DHT.
+    // Порт 0 — эфемерный (тесты): пробрасывать бессмысленно и нечего.
+    let nat_task = if local_port != 0 {
+        Some(nat_actor(local_port).await)
+    } else {
+        None
+    };
+    let nat_mapping = nat_task.as_ref().and_then(|task| task.mapping);
+    // Порт анонса: внешний из маппинга, иначе локальный.
+    let announce_port = nat_mapping.map_or(local_port, |m| m.external_port);
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
 
@@ -491,17 +597,14 @@ async fn run_session(
         announce_actors.push(AnnounceActor { tx, task });
     }
 
-    // `DHT` (только `magnet`): UDP на том же порту, что TCP-слушатель.
-    let dht_client = if magnet.is_some() {
-        match dht::DhtClient::bind(announce_port).await {
-            Ok(client) => Some(client),
-            Err(err) => {
-                tracing::warn!(%err, "dht bind failed, continuing without dht");
-                None
-            }
+    // `DHT` для любого источника (.torrent тоже): пиры нужны всегда; UDP на том
+    // же порту, что TCP-слушатель (локальный).
+    let dht_client = match dht::DhtClient::bind(local_port).await {
+        Ok(client) => Some(client),
+        Err(err) => {
+            tracing::warn!(%err, "dht bind failed, continuing without dht");
+            None
         }
-    } else {
-        None
     };
     let dht_forward_task = dht_client.as_ref().map(|client| {
         let client = client.clone();
@@ -581,6 +684,8 @@ async fn run_session(
         announce_actors,
         announce_next: None,
         dht: dht_client,
+        local_port,
+        nat: nat_mapping,
         info_hash,
         our_peer_id,
         piece_count,
@@ -616,7 +721,7 @@ async fn run_session(
     }
 
     // Teardown выполняется и при ошибке цикла: соединения/актор/диск убираются всегда.
-    let session_result = session_loop(&mut hub, &mut event_rx, seed, shutdown).await;
+    let session_result = session_loop(&mut hub, &mut event_rx, seed, pex_interval, shutdown).await;
     if matches!(session_result, Ok(true)) {
         hub.send_announce(Some(Event::Completed));
         // `DHT`-анонс: заявляем себя в рой (best-effort, в фоне).
@@ -630,7 +735,7 @@ async fn run_session(
         }
     }
     let paths = std::mem::take(&mut hub.paths);
-    let teardown_result = teardown_session(hub, dht_forward_task, accept_task).await;
+    let teardown_result = teardown_session(hub, dht_forward_task, accept_task, nat_task).await;
     // Ошибка цикла важнее ошибки разбора.
     match (session_result, teardown_result) {
         (Err(err), _) | (Ok(_), Err(err)) => Err(err),
@@ -671,10 +776,13 @@ async fn session_loop(
     hub: &mut Hub,
     event_rx: &mut mpsc::UnboundedReceiver<HubEvent>,
     seed: bool,
+    pex_interval: Duration,
     mut shutdown: mpsc::Receiver<()>,
 ) -> Result<bool, EngineError> {
     let mut choke_timer = tokio::time::interval(CHOKE_PERIOD);
     choke_timer.tick().await; // interval стреляет мгновенно первым тиком — поглощаем
+    let mut pex_timer = tokio::time::interval(pex_interval);
+    pex_timer.tick().await; // поглощаем мгновенный первый тик
     let mut idle = Box::pin(tokio::time::sleep(IDLE_TIMEOUT));
     let mut announce_deadline: Option<tokio::time::Instant> = None;
 
@@ -697,6 +805,7 @@ async fn session_loop(
                 announce_deadline = None; // до результата
             }
             _ = choke_timer.tick() => hub.recompute_chokes(),
+            _ = pex_timer.tick() => hub.flush_pex(),
             () = &mut idle, if matches!(hub.phase, Phase::Download | Phase::Metadata) =>
                 return Err(EngineError::IdleTimeout),
         }
@@ -719,6 +828,7 @@ async fn teardown_session(
     mut hub: Hub,
     dht_forward_task: Option<tokio::task::JoinHandle<()>>,
     accept_task: tokio::task::JoinHandle<()>,
+    mut nat_task: Option<NatActor>,
 ) -> Result<(), EngineError> {
     // Финальные Stopped-анонсы: best-effort, ждём недолго и обрываем акторов.
     let mut announce_tasks = Vec::new();
@@ -740,6 +850,16 @@ async fn teardown_session(
     accept_task.abort();
     if let Some(task) = dht_forward_task {
         task.abort();
+    }
+    // UPnP: unmap с дедлайном, потом abort (зеркало teardown анонс-акторов).
+    if let Some(nat) = nat_task.as_mut() {
+        let _ = nat.shutdown_tx.send(());
+        if tokio::time::timeout(NAT_UNMAP_TIMEOUT, &mut nat.task)
+            .await
+            .is_err()
+        {
+            nat.task.abort();
+        }
     }
     let disk_task = hub.disk_task.take();
     drop(hub); // закрывает disk_tx и DhtClient — задачи дообработают и выйдут
@@ -832,6 +952,79 @@ async fn announce_actor(
     }
 }
 
+/// Управление UPnP-маппингом: хэндл + задача (решение этапа 6, Q8).
+struct NatActor {
+    shutdown_tx: mpsc::UnboundedSender<()>,
+    task: tokio::task::JoinHandle<()>,
+    /// Результат стартовой попытки маппинга (`None` — неудача, ретраим).
+    mapping: Option<nat::NatMapping>,
+}
+
+/// Стартует UPnP-маппинг и фоновый актор его жизненного цикла.
+/// Стартовая попытка — до анонс-акторов (таймаут [`nat::NAT_TIMEOUT`] внутри);
+/// при неудаче — тихий ретрай раз в [`NAT_RETRY_PERIOD`]; на shutdown — unmap
+/// с дедлайном [`NAT_UNMAP_TIMEOUT`] (после — abort, зеркало teardown анонс-акторов).
+async fn nat_actor(local_port: u16) -> NatActor {
+    let (shutdown_tx, shutdown_rx) = mpsc::unbounded_channel();
+    let join = tokio::task::spawn_blocking(move || nat::map_tcp(local_port));
+    let mapping = match join.await {
+        Ok(Ok(mapping)) => {
+            tracing::info!(
+                local_port,
+                external_port = mapping.external_port,
+                external_ip = %mapping.external_ip,
+                "upnp mapping established"
+            );
+            Some(mapping)
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(%err, "upnp mapping failed, will retry in background");
+            None
+        }
+        Err(join) => {
+            tracing::warn!(%join, "upnp mapping task panicked");
+            None
+        }
+    };
+    let task = tokio::spawn(nat_lifecycle(local_port, mapping, shutdown_rx));
+    NatActor {
+        shutdown_tx,
+        task,
+        mapping,
+    }
+}
+
+/// Жизненный цикл маппинга: держит его до shutdown; при отсутствии — ретрай
+/// каждые [`NAT_RETRY_PERIOD`]. При позднем успехе анонс-порт уже зафиксирован
+/// локальным — маппинг всё равно делает нас доступными для входящих.
+async fn nat_lifecycle(
+    local_port: u16,
+    mut mapping: Option<nat::NatMapping>,
+    mut shutdown: mpsc::UnboundedReceiver<()>,
+) {
+    while mapping.is_none() {
+        tokio::select! {
+            _ = shutdown.recv() => return, // маппинга нет — снимать нечего
+            () = tokio::time::sleep(NAT_RETRY_PERIOD) => {}
+        }
+        match tokio::task::spawn_blocking(move || nat::map_tcp(local_port)).await {
+            Ok(Ok(m)) => {
+                tracing::info!(external_port = m.external_port, "upnp retry succeeded");
+                mapping = Some(m);
+            }
+            Ok(Err(err)) => tracing::debug!(%err, "upnp retry failed"),
+            Err(join) => tracing::debug!(%join, "upnp retry task panicked"),
+        }
+    }
+    // Маппинг жив (lease 0): ждём shutdown, снимаем.
+    let _ = shutdown.recv().await;
+    let external_port = mapping.map_or(0, |m| m.external_port);
+    let unmap = tokio::task::spawn_blocking(move || nat::unmap_tcp(external_port));
+    if let Ok(Err(err)) = unmap.await {
+        tracing::debug!(%err, "upnp unmap failed");
+    }
+}
+
 /// Accept-луп: входящие соединения с валидным handshake становятся пирами
 /// (чужой `info_hash` — тихое закрытие). Ошибки accept не убивают сессию.
 async fn accept_loop(
@@ -897,6 +1090,10 @@ struct Hub {
     announce_next: Option<Duration>,
     /// `DHT`-клиент (только `magnet`-сценарий).
     dht: Option<dht::DhtClient>,
+    /// Локальный TCP-порт слушателя (для фильтрации собственного адреса).
+    local_port: u16,
+    /// UPnP-маппинг, если удался (внешний адрес для фильтрации себя в PEX).
+    nat: Option<nat::NatMapping>,
     info_hash: [u8; 20],
     our_peer_id: [u8; 20],
     /// 0 в `magnet`-фазе — метаданные ещё не получены.
@@ -967,10 +1164,174 @@ impl Hub {
         }
     }
 
-    /// Наш ext handshake (`BEP 10`): `m.ut_metadata` + `metadata_size`, когда
-    /// метаданные уже известны.
+    /// Наш ext handshake (`BEP 10`): полный `m`-дикт (`ut_metadata` +
+    /// `ut_pex`) + `metadata_size`, когда метаданные уже известны.
     fn my_ext_handshake(&self) -> Vec<u8> {
-        ext_metadata::encode_ext_handshake(self.info_bytes.as_ref().map(|b| b.len()))
+        let mut m = ext_metadata::our_extensions();
+        m.insert(ext_pex::UT_PEX_NAME.to_vec(), OUR_UT_PEX_ID);
+        ext_metadata::encode_ext_handshake(&m, self.info_bytes.as_ref().map(|b| b.len()))
+    }
+
+    // --- PEX (`BEP 11`): хаб — единственный владелец истины о сворме ---
+
+    /// Является ли адрес нашим собственным (не отправлять пирам самих нас).
+    /// Полное сравнение возможно только для внешнего адреса из UPnP-маппинга;
+    /// локальный сравниваем по порту + loopback (приближение того же маша).
+    // ponytail: список локальных интерфейсов не собираем — loopback+порт
+    // покрывает тесты и loopback-сценарии; полное покрытие не нужно,
+    // ложный «не я» безвреден (дедуп + дедуп-конвейер).
+    fn is_self(&self, addr: SocketAddr) -> bool {
+        if let Some(mapping) = &self.nat {
+            if addr.ip() == IpAddr::V4(mapping.external_ip) && addr.port() == mapping.external_port
+            {
+                return true;
+            }
+        }
+        addr.port() == self.local_port && (addr.ip().is_loopback() || addr.ip().is_unspecified())
+    }
+
+    /// Флаг сидера по текущему битфилду пира (0x02 — полный).
+    fn pex_flags_of(link: &PeerLink) -> u8 {
+        if link.bitfield.is_full() {
+            PEER_FLAG_SEED
+        } else {
+            0
+        }
+    }
+
+    /// Новый пир в сворме: добавляем в outbox всем PEX-пирам (кроме себя).
+    fn pex_peer_added(&mut self, addr: PeerHandle) {
+        let Some(v4) = peer_v4(addr) else { return };
+        if v4.port() == 0 || self.is_self(addr) {
+            return;
+        }
+        for (other, link) in &mut self.peers {
+            if *other != addr {
+                if let Some(outbox) = link.pex_outbox.as_mut() {
+                    outbox.add(v4); // свежий пир — флаги неизвестны, 0
+                }
+            }
+        }
+    }
+
+    /// Пир покинул сворм: dropped в outbox всем остальным PEX-пирам.
+    fn pex_peer_dropped(&mut self, addr: PeerHandle) {
+        let Some(v4) = peer_v4(addr) else { return };
+        for (other, link) in &mut self.peers {
+            if *other != addr {
+                if let Some(outbox) = link.pex_outbox.as_mut() {
+                    outbox.drop_peer(v4);
+                }
+            }
+        }
+    }
+
+    /// Глобальный тикер PEX: раз в [`PEX_INTERVAL`] обходим всех пиров,
+    /// объявивших `ut_pex`, и шлём каждому полную карту или дельту.
+    fn flush_pex(&mut self) {
+        // Снимок сворма для первых flush: только реальные соединения
+        // (анти-poisoning, правило Azureus), кроме получателя, порта 0 и себя.
+        let full_lists: HashMap<PeerHandle, PexUpdate> = self
+            .peers
+            .iter()
+            .filter(|(_handle, link)| link.pex_outbox.as_ref().is_some_and(|o| !o.full_sent))
+            .map(|(handle, _)| {
+                let added = self
+                    .peers
+                    .iter()
+                    .filter(|(other, _)| **other != *handle)
+                    .filter(|(other, _)| other.port() != 0)
+                    .filter(|(other, _)| !self.is_self(**other))
+                    .filter_map(|(other, other_link)| {
+                        peer_v4(*other).map(|addr| PexPeer {
+                            addr,
+                            flags: Self::pex_flags_of(other_link),
+                        })
+                    })
+                    .collect();
+                (
+                    *handle,
+                    PexUpdate {
+                        added,
+                        dropped: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        for (handle, link) in &mut self.peers {
+            let Some(outbox) = link.pex_outbox.as_mut() else {
+                continue; // пир не поддерживает ut_pex
+            };
+            let update = if let Some(full) = full_lists.get(handle) {
+                outbox.full_sent = true;
+                // Накопленные дельты перекрываются полным списком — сбрасываем.
+                outbox.added.clear();
+                outbox.dropped.clear();
+                full.clone()
+            } else if !outbox.added.is_empty() || !outbox.dropped.is_empty() {
+                outbox.drain()
+            } else {
+                continue;
+            };
+            let (added, dropped) = (update.added.len(), update.dropped.len());
+            let payload = ext_pex::encode_pex(&update);
+            let _ = link
+                .cmd_tx
+                .send(PeerCommand::Message(PeerMessage::Extended {
+                    ext_id: OUR_UT_PEX_ID,
+                    payload,
+                }));
+            tracing::debug!(peer = %handle, added, dropped, "pex sent");
+        }
+    }
+
+    /// Входящее PEX-сообщение: флуд-контроль (<1 с — молча игнор), капы
+    /// (>1000 added/dropped — disconnect, `DoS`), структурный мусор —
+    /// ignore + warn. Выученные адреса — в стандартный дедуп-конвейер;
+    /// они не verified и в чужие outbox'ы не попадут до реального соединения.
+    fn on_pex(&mut self, handle: PeerHandle, payload: &[u8]) {
+        let Some(link) = self.peers.get_mut(&handle) else {
+            return;
+        };
+        let now = Instant::now();
+        if link
+            .last_pex
+            .is_some_and(|t| now.duration_since(t) < PEX_MIN_INTERVAL)
+        {
+            return; // флуд: соединение живёт, сообщение молча игнорируется
+        }
+        link.last_pex = Some(now);
+        let update = match ext_pex::parse_pex(payload) {
+            Ok(update) => update,
+            Err(err @ (PexError::TooManyAdded(_) | PexError::TooManyDropped(_))) => {
+                tracing::warn!(peer = %handle, %err, "pex cap exceeded, disconnecting");
+                self.disconnect(handle);
+                return;
+            }
+            Err(err) => {
+                // Структурный мусор: ресинхронизация дешёвая, disconnect на
+                // любой чих — вектор выкидывания из сворма.
+                tracing::debug!(peer = %handle, %err, "malformed pex ignored");
+                return;
+            }
+        };
+        // Флаги парсятся, потребителя нет — TODO seeder-priority.
+        let added_count = update.added.len();
+        for peer in update.added {
+            let addr = SocketAddr::V4(peer.addr);
+            if peer.addr.port() != 0 && !self.is_self(addr) {
+                self.enqueue(addr);
+            }
+        }
+        if matches!(self.phase, Phase::Download | Phase::Metadata) {
+            self.spawn_from_queue();
+        }
+        tracing::debug!(
+            peer = %handle,
+            added = added_count,
+            dropped = update.dropped.len(),
+            "pex received"
+        );
     }
 
     /// Разрывает соединение с пиром.
@@ -996,8 +1357,13 @@ impl Hub {
                 raw_bitfield: None,
                 collector: None,
                 peer_ut_id: None,
+                peer_pex_id: None,
+                pex_outbox: None,
+                last_pex: None,
             },
         );
+        // Уведомляем PEX-пиров о новом участнике сворма.
+        self.pex_peer_added(addr);
         // Битфилд — one-shot: в фазах Recheck/Metadata on_disk неполный, полный
         // уйдёт в initialize_peers_for_download после RecheckDone.
         let my_bitfield = if matches!(self.phase, Phase::Recheck | Phase::Metadata) {
@@ -1036,8 +1402,13 @@ impl Hub {
                 raw_bitfield: None,
                 collector: None,
                 peer_ut_id: None,
+                peer_pex_id: None,
+                pex_outbox: None,
+                last_pex: None,
             },
         );
+        // Уведомляем PEX-пиров о новом участнике сворма.
+        self.pex_peer_added(handle);
         // Битфилд — one-shot: в фазах Recheck/Metadata on_disk неполный, полный
         // уйдёт в initialize_peers_for_download после RecheckDone.
         let my_bitfield = if matches!(self.phase, Phase::Recheck | Phase::Metadata) {
@@ -1306,6 +1677,8 @@ impl Hub {
                 payload,
             } => self.on_extended(handle, ext_id, &payload),
             PeerEvent::Disconnected { handle } => {
+                // PEX: сообщаем остальным supporting-пирам (до удаления линка).
+                self.pex_peer_dropped(handle);
                 if let Some(pm) = self.pm.as_mut() {
                     pm.on_peer_disconnected(handle);
                 }
@@ -1323,6 +1696,12 @@ impl Hub {
     fn on_extended(&mut self, handle: PeerHandle, ext_id: u8, payload: &[u8]) {
         if ext_id == EXTENDED_HANDSHAKE_ID {
             self.on_ext_handshake(handle, payload);
+            return;
+        }
+        if ext_id == OUR_UT_PEX_ID {
+            // Входящие PEX приходят под НАШИМ объявленным id (правило BEP 10);
+            // поддержка пира проверяется внутри on_pex по наличию линка.
+            self.on_pex(handle, payload);
             return;
         }
         let msg = match ext_metadata::parse_metadata_message(payload) {
@@ -1364,12 +1743,18 @@ impl Hub {
             }
         };
         if let Some(link) = self.peers.get_mut(&handle) {
-            link.peer_ut_id = hs.ut_metadata_id;
+            link.peer_ut_id = hs.ut_metadata_id();
+            // PEX активен с первого ext handshake (включая magnet-фазу): id
+            // запоминаем, outbox создаётся — первый flush уйдёт полным списком.
+            link.peer_pex_id = hs.extension_id(ext_pex::UT_PEX_NAME);
+            if link.peer_pex_id.is_some() && link.pex_outbox.is_none() {
+                link.pex_outbox = Some(PexOutbox::default());
+            }
         }
         if self.phase != Phase::Metadata {
             return; // метаданные уже есть/не нужны — дальше обычный протокол
         }
-        let Some(peer_ut_id) = hs.ut_metadata_id else {
+        let Some(peer_ut_id) = hs.ut_metadata_id() else {
             tracing::debug!(peer = %handle, "no ut_metadata support, disconnecting");
             self.disconnect(handle);
             return;

@@ -18,13 +18,13 @@ crates/
 ├── bencode/       # кодек bencode (этап 1) ✅
 ├── metainfo/      # разбор .torrent, info-hash (этап 1) ✅
 ├── tracker/       # HTTP-announce (этап 2) ✅, UDP-announce (этап 4) ✅
-├── peer-wire/     # handshake + фрейминг сообщений пиров (этап 2) ✅, этап 6 — расширения
+├── peer-wire/     # handshake + фрейминг сообщений пиров (этап 2) ✅, расширения (этап 6) ✅
 ├── cli/           # бинарник для сквозной проверки этапов ✅ (этап 3: полное скачивание)
-├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce/seeding (этап 4) ✅
+├── engine/        # менеджер кусков, дисковый слой, оркестрация (этап 3) ✅, UDP-announce/seeding (этап 4) ✅, PEX/NAT (этап 6) ✅
 ├── dht/           # Kademlia DHT (этап 5) ✅
 ├── ext-metadata/  # extension protocol + ut_metadata (этап 5) ✅
-├── ext-pex/       # ut_pex (этап 6)                                     — ещё не создан
-└── nat/           # UPnP/NAT-PMP (этап 6)                               — ещё не создан
+├── ext-pex/       # ut_pex (этап 6) ✅
+└── nat/           # UPnP/NAT-PMP (этап 6) ✅
 ```
 
 Новые крейты добавляются в `crates/` — `members = ["crates/*"]` подхватит их сам.
@@ -140,7 +140,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 3. ✅ Менеджер кусков, дисковый слой, пайплайн скачивания (приёмка: Debian 13.6 netinst 755 МБ, SHA-256 совпал с официальным)
 4. ✅ UDP-трекеры + seeding/choking (NAT через порт — этап 6)
 5. ✅ DHT, magnet-ссылки, extension protocol + ut_metadata (приёмка: magnet без tr= по чистому DHT, Debian 13.6 netinst 755 МБ, SHA-256 совпал)
-6. ut_pex, UPnP/NAT-PMP, полировка peer-wire
+6. ✅ ut_pex, UPnP/NAT-PMP, полировка peer-wire
 
 Каждый новый этап начинается с прожарки требований (grill), итоги — в `GRILL-ME-stage<N>.md`.
 
@@ -169,3 +169,18 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - **Отдача**: request от interested+unchoke пира → валидация диапазона (len 0 / >128 КиБ / вне куска → Disconnect) → `DiskCommand::ReadBlock` в общий диск-таск → Piece. Служатся только диск-подтверждённые куски (recheck + ack'и записи). Чужие Cancel игнорируются. uploaded — реальный счётчик в анонсе и Progress.
 - **Choking**: round-robin окно по заинтересованным пирам + optimistic-слот, ротация каждым recompute (10 с и по событию Interested), diff (Unchoke/Choke) минимальный. `ChokeManager` — чистая структура, политика локальна в `recompute`; tit-for-tat — оптимизация.
 - **Ловушка фикстур**: тестовый торрент с нулевым куском 0 «скачивается» recheck'ом из sparse-нулевой преаллокации — данные фикстур не должны совпадать с нулями.
+
+## Решения этапа 6 (не менять без обсуждения)
+
+Полный разбор — в `GRILL-ME-stage6.md`. Ключевое:
+
+- **ext-pex (BEP 11)**: чистый кодек + константы (`OUR_UT_PEX_ID=3`, `PEX_INTERVAL=60 с`, кап 1000, `PEX_MIN_INTERVAL=1 с`); только IPv4 (`added6` — YAGNI). Парсер: отсутствующие ключи = пустые; структурный мусор (длины, `added.f`, хвостовые байты) → ошибка; кап 1000 → `TooManyAdded/Dropped` (disconnect на стороне engine). 17 юнит-тестов по DoD (BEP-примеры, обрывы на каждом суффиксе, мусор после валидных данных, границы).
+- **Outbox-модель Transmission**: хаб — единственный владелец истины о сворме, per-recipient `PexOutbox` (added/dropped + `full_sent`); первый flush — полный список (лениво, на момент flush — гонки «пир подключился до handshake» не теряют участников), дальше дельты. Исключения: получатель, порт 0, свой адрес (`is_self`: UPnP-external или loopback+локальный порт). В outbox — только реальные соединения (verified-only, анти-poisoning).
+- **Flush**: один глобальный тикер в `session_loop`; шов — `session_test` (`PEX_TEST_INTERVAL=1 с`, doc-hidden). Входящие маршрутизируются по НАШЕМУ объявленному id (`ext_id == OUR_UT_PEX_ID`); флуд <1 с — молча игнор; >1000 — disconnect; мусор — ignore+warn. Выученные адреса — в стандартный дедуп-конвейер (tried-сет, не verified).
+- **ext-metadata**: `ExtHandshake` перешёл на полный `m`-дикт (`BTreeMap<Vec<u8>, u8>`, lookup `extension_id(name)`); `encode_ext_handshake(extensions, metadata_size)` — состав `m` задаёт вызывающий (engine объявляет `ut_metadata`+`ut_pex` безусловно); PEX активен с первого ext handshake, включая magnet-фазу.
+- **peer-wire**: `Bitfield::is_full()` — источник флага 0x02 для `added.f` (0x01 всегда 0 — MSE нет, не врать).
+- **nat (UPnP IGD, igd-next)**: блокирующий API за `spawn_blocking`; `map_tcp` — тот же порт, при отказе `add_any_port` (свободный); lease 0 (ponytail-коммент: крах → зависший маппинг; потолок задокументирован); таймаут 10 с константой крейта; только TCP (UDP DHT пробивается сам); NAT-PMP — ноль кода.
+- **Жизненный цикл NAT**: маппинг при старте `run_session` до анонс-акторов, только если порт ≠ 0 (тесты на 0 чистые автоматически); неудача → тихий ретрай раз в 10 мин; успех → внешний порт в announce (HTTP/UDP) и DHT `announce_peer`; unmap на shutdown с дедлайном 5 с → abort.
+- **Приёмка PEX**: A и B — реальные engine (A знает только B, B — только C), C — фейковый seeder со счётом РАЗНЫХ peer_id handshake'ов; критерий — второе рукопожатие от A на C. Ловушка: личер A в фазе Seed не дозванивается из очереди — данные от C подаются с задержкой 100 мс/блок, чтобы A гарантированно оставался в Download к моменту flush. Плюс юниты: «пир без ut_pex не получает PEX» и «сидер в added несёт 0x02».
+- **Зависимости**: ext-pex = bencode+thiserror; nat = igd-next+thiserror (без tokio — крейт блокирующий); engine = + ext-pex, nat; dev-dep engine — tracing-subscriber (диагностика приёмки).
+- **DHT для любого источника**: изначально DHT-клиент биндился только в magnet-сессии — `.torrent` оставался без пиров, если трекеры недоступны (ловля на живой раздаче за Cloudflare-блоком). DHT включён всегда; `DiscoveredPeers` хаб обрабатывал без гейта, сломан был только бинд.

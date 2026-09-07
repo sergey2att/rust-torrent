@@ -1,0 +1,13 @@
+[package]
+name = "nat"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+igd-next = "0.17"
+thiserror.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

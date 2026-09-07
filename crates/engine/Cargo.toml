@@ -9,6 +9,8 @@ tracker = { path = "../tracker" }
 peer-wire = { path = "../peer-wire" }
 dht = { path = "../dht" }
 ext-metadata = { path = "../ext-metadata" }
+ext-pex = { path = "../ext-pex" }
+nat = { path = "../nat" }
 thiserror.workspace = true
 sha1.workspace = true
 fastrand.workspace = true
@@ -19,6 +21,7 @@ tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macro
 bencode = { path = "../bencode" }
 tempfile = "3"
 tokio = { workspace = true, features = ["rt-multi-thread"] }
+tracing-subscriber = "0.3"
 
 [lints]
 workspace = true

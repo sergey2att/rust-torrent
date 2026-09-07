@@ -5,8 +5,8 @@
 
 use ext_metadata::{
     check_metadata_size, encode_ext_handshake, encode_metadata_reply, encode_metadata_request,
-    fetch_metadata, parse_ext_handshake, parse_metadata_message, ExtError, MetadataCollector,
-    MetadataMessage, MAX_METADATA_SIZE, METADATA_PIECE_LEN, OUR_UT_METADATA_ID,
+    fetch_metadata, our_extensions, parse_ext_handshake, parse_metadata_message, ExtError,
+    MetadataCollector, MetadataMessage, MAX_METADATA_SIZE, METADATA_PIECE_LEN, OUR_UT_METADATA_ID,
 };
 use peer_wire::{
     read_message, write_message, PeerMessage, EXTENDED_HANDSHAKE_ID, EXTENSION_PROTOCOL_BIT,
@@ -315,15 +315,21 @@ fn metadata_size_limits_are_enforced() {
 
 #[test]
 fn ext_handshake_round_trip_with_custom_fields() {
-    let payload = encode_ext_handshake(Some(12345));
+    let payload = encode_ext_handshake(&our_extensions(), Some(12345));
     let hs = parse_ext_handshake(&payload).unwrap();
-    assert_eq!(hs.ut_metadata_id, Some(OUR_UT_METADATA_ID));
+    assert_eq!(hs.ut_metadata_id(), Some(OUR_UT_METADATA_ID));
     assert_eq!(hs.metadata_size, Some(12345));
     // Без размера (magnet-фаза).
-    let hs = parse_ext_handshake(&encode_ext_handshake(None)).unwrap();
+    let hs = parse_ext_handshake(&encode_ext_handshake(&our_extensions(), None)).unwrap();
     assert_eq!(hs.metadata_size, None);
     // Мусор — ошибка.
     assert!(parse_ext_handshake(b"garbage").is_err());
+    // Полный m-дикт: чужие расширения видны, id 0 = не поддерживается.
+    let mut m = our_extensions();
+    m.insert(b"ut_pex".to_vec(), 3);
+    let hs = parse_ext_handshake(&encode_ext_handshake(&m, None)).unwrap();
+    assert_eq!(hs.extension_id(b"ut_pex"), Some(3));
+    assert_eq!(hs.extension_id(b"unknown_ext"), None);
 }
 
 #[test]

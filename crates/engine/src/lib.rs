@@ -1,5 +1,5 @@
 //! Engine: менеджер кусков, дисковый слой и оркестрация многопировой
-//! сессии — скачивание и раздача (этапы 3–5).
+//! сессии — скачивание и раздача (этапы 3–6).
 //!
 //! Архитектура — актор на mpsc (см. `GRILL-ME-stage3.md`, `GRILL-ME-stage4.md`):
 //! - хаб владеет [`PieceManager`] и раздаёт блоки пирам;
@@ -26,7 +26,7 @@ pub use choke::{ChokeDecision, ChokeManager};
 pub use piece_manager::{BlockRequest, PeerHandle, PieceEvent, PieceManager};
 pub use session::{
     download, download_magnet_with_peers, download_source, download_with_peers, session,
-    session_source, MetadataInfo, Progress, Source,
+    session_source, session_test, MetadataInfo, Progress, Source,
 };
 pub use storage::DiskStorage;
 

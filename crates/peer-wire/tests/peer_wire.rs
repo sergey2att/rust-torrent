@@ -340,6 +340,23 @@ fn bitfield_zero_pieces_wire_is_empty_vec() {
     assert!(empty.is_empty());
 }
 
+/// Полная карта (все куски) — `is_full`; частичная и пустая — нет.
+#[test]
+fn bitfield_is_full_only_when_every_piece_set() {
+    // Ровно 8 кусков = один байт 0xFF.
+    let bf = Bitfield::from_wire(vec![0xFF], 8).unwrap();
+    assert!(bf.is_full());
+    // Некратный байт: 9 кусков, хвостовой бит 0.
+    let bf = Bitfield::from_wire(vec![0xFF, 0b1000_0000], 9).unwrap();
+    assert!(bf.is_full());
+    // Один кусок не доставает.
+    let bf = Bitfield::from_wire(vec![0xFE, 0b1000_0000], 9).unwrap();
+    assert!(!bf.is_full());
+    // Пустая карта и сворм без кусков — не сидер.
+    assert!(!Bitfield::new_empty(8).is_full());
+    assert!(!Bitfield::new_empty(0).is_full());
+}
+
 // Таймауты (15 с handshake) применяются вокруг всей операции; здесь
 // операции; здесь проверяем только маппинг Elapsed → Timeout — реальные 60 с
 // в тесте ждать не нужно.

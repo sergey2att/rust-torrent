@@ -455,6 +455,13 @@ impl Bitfield {
         self.bytes.iter().all(|&b| b == 0)
     }
 
+    /// `true`, если установлены все `piece_count` битов (пир — сидер).
+    #[must_use]
+    pub fn is_full(&self) -> bool {
+        self.piece_count > 0
+            && self.bytes.iter().map(|&b| b.count_ones()).sum::<u32>() as usize == self.piece_count
+    }
+
     /// Число кусков, на которое рассчитана карта.
     pub fn piece_count(&self) -> usize {
         self.piece_count
