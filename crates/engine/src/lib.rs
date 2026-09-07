@@ -25,10 +25,15 @@ mod storage;
 pub use choke::{ChokeDecision, ChokeManager};
 pub use piece_manager::{BlockRequest, PeerHandle, PieceEvent, PieceManager};
 pub use session::{
-    download, download_magnet_with_peers, download_source, download_with_peers, session,
-    session_source, session_test, MetadataInfo, Progress, Source,
+    download, download_magnet_with_peers, download_source, download_with_peers, resolve_bootstrap,
+    run_session, session, session_source, session_test, AcceptSource, MetadataInfo,
+    NetworkEndpoints, Progress, RoutedPeer, SessionCommand, SessionConfig, Source,
+    DHT_BOOTSTRAP_HOSTS,
 };
-pub use storage::DiskStorage;
+pub use storage::{torrent_root, DiskStorage};
+
+pub use ext_pex::PEX_INTERVAL;
+pub use session::{acquire_nat_mapping, NatLease};
 
 /// Максимальное число одновременных соединений с пирами.
 pub const MAX_CONNECTIONS: usize = 50;

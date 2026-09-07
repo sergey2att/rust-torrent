@@ -201,7 +201,7 @@ async fn spawn_pex_observer(support_pex: bool) -> (PeerHandle, mpsc::UnboundedRe
 /// задачу вместе со стоп-каналом.
 type EngineTask = (
     tokio::task::JoinHandle<Result<Vec<std::path::PathBuf>, engine::EngineError>>,
-    mpsc::Sender<()>,
+    mpsc::Sender<engine::SessionCommand>,
     mpsc::UnboundedReceiver<engine::Progress>,
 );
 
@@ -212,7 +212,7 @@ fn spawn_engine(
     initial_peers: Vec<PeerHandle>,
     seed: bool,
 ) -> EngineTask {
-    let (stop_tx, stop_rx) = mpsc::channel(1);
+    let (stop_tx, stop_rx) = mpsc::channel::<engine::SessionCommand>(1);
     let (progress_tx, progress_rx) = mpsc::unbounded_channel();
     let dir = dir.to_path_buf();
     let task = tokio::spawn(async move {
@@ -289,7 +289,7 @@ async fn pex_discovery_via_pex_only() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    a_stop.send(()).await.unwrap();
+    a_stop.send(engine::SessionCommand::Shutdown).await.unwrap();
     let a_files = tokio::time::timeout(Duration::from_secs(10), a_task)
         .await
         .expect("сессия A не остановилась")
@@ -299,7 +299,7 @@ async fn pex_discovery_via_pex_only() {
     let content = std::fs::read(&a_files[0]).unwrap();
     assert_eq!(content, expected, "A обязан скачать корректные данные");
 
-    b_stop.send(()).await.unwrap();
+    b_stop.send(engine::SessionCommand::Shutdown).await.unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), b_task).await;
 }
 
@@ -373,6 +373,6 @@ async fn pex_added_carries_seed_flag_for_full_bitfield() {
         update.added
     );
 
-    stop.send(()).await.unwrap();
+    stop.send(engine::SessionCommand::Shutdown).await.unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
 }

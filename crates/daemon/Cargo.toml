@@ -1,0 +1,26 @@
+[package]
+name = "daemon"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+engine = { path = "../engine" }
+metainfo = { path = "../metainfo" }
+peer-wire = { path = "../peer-wire" }
+tracker = { path = "../tracker" }
+dht = { path = "../dht" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex.workspace = true
+thiserror.workspace = true
+tracing = "0.1"
+tokio = { workspace = true, features = ["net", "io-util", "time", "sync", "macros", "rt"] }
+
+[dev-dependencies]
+sha1.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
+[lints]
+workspace = true

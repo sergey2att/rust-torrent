@@ -2,14 +2,8 @@
 resolver = "2"
 members = ["crates/*"]
 
-# Крейты будущих этапов (создаются своими этапами, members = ["crates/*"] подхватит их сам):
-#   tracker       — HTTP-announce (этап 2), UDP-announce (этап 4)
-#   peer-wire     — handshake + фрейминг сообщений пиров (этапы 2, 6)
-#   engine        — менеджер кусков, дисковый слой, оркестрация (этапы 3, 4)
-#   dht           — Kademlia DHT (этап 5)
-#   ext-metadata  — extension protocol + ut_metadata (этап 5)
-#   ext-pex       — ut_pex (этап 6)
-#   nat           — UPnP/NAT-PMP (этап 6)
+# Этап 8: Tauri-приложение (app/src-tauri) добавляется в members явно —
+# crates/* его не подхватит.
 
 [workspace.package]
 edition = "2021"
@@ -23,6 +17,8 @@ reqwest = "0.12"
 percent-encoding = "2"
 url = "2"
 fastrand = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 # Линты: дефолт clippy + наши стилевые правила проекта.
 # Дефолтные (warn by default) остаются; здесь — надбавка.

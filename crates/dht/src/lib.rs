@@ -54,6 +54,9 @@ const TOKEN_TTL: Duration = Duration::from_secs(300);
 /// Максимум пиров в кэше на один `info_hash` (ответы на `get_peers`).
 const PEER_CACHE_PER_INFO_HASH: usize = 256;
 
+/// Сколько узлов возвращаем в [`DhtClient::nodes_snapshot`] (персистенция).
+const NODE_SNAPSHOT_CAP: usize = 256;
+
 /// Ошибка `DHT`-клиента.
 #[derive(Debug, thiserror::Error)]
 pub enum DhtError {
@@ -85,6 +88,9 @@ enum Command {
         info_hash: [u8; 20],
         port: u16,
         reply: oneshot::Sender<Result<(), DhtError>>,
+    },
+    DumpNodes {
+        reply: oneshot::Sender<Vec<DhtNode>>,
     },
 }
 
@@ -202,6 +208,17 @@ impl DhtClient {
             .map_err(|_| DhtError::ClientGone)?;
         rx.await.map_err(|_| DhtError::ClientGone)?
     }
+
+    /// Снимок известных узлов таблицы (для персистенции между запусками:
+    /// сохранить при shutdown, отдать в `bootstrap` при следующем старте —
+    /// тёплый старт без холодного обхода).
+    pub async fn nodes_snapshot(&self) -> Vec<DhtNode> {
+        let (reply, rx) = oneshot::channel();
+        if self.cmd_tx.send(Command::DumpNodes { reply }).is_err() {
+            return Vec::new(); // актор завершён
+        }
+        rx.await.unwrap_or_default()
+    }
 }
 
 /// Адаптер mpsc-приёмника в [`Stream`] (публичный контракт крейта).
@@ -294,6 +311,9 @@ impl Actor {
             } => {
                 let result = self.announce(info_hash, port).await;
                 let _ = reply.send(result);
+            }
+            Command::DumpNodes { reply } => {
+                let _ = reply.send(self.table.closest(&self.id, NODE_SNAPSHOT_CAP));
             }
         }
     }
@@ -661,6 +681,14 @@ mod tests {
 
     use super::*;
     use crate::krpc::{encode_response, parse};
+
+    /// `nodes_snapshot` на живом акторе без сети: пустая таблица — пустой
+    /// снимок, канал команд `DumpNodes` работает.
+    #[tokio::test]
+    async fn nodes_snapshot_of_fresh_client_is_empty() {
+        let client = DhtClient::bind(0).await.unwrap();
+        assert!(client.nodes_snapshot().await.is_empty());
+    }
 
     /// Регрессия: декремент бюджета в момент отправки, а не пуша кандидата,
     /// при budget 1..2 и ALPHA пушил 3 узла → `budget -= 1` уходил в минус

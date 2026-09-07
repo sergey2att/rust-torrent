@@ -8,7 +8,7 @@
     clippy::cast_lossless
 )] // тесты вправе паниковать
 
-use engine::{download_with_peers, PeerHandle, Progress};
+use engine::{download_with_peers, PeerHandle, Progress, SessionCommand};
 use metainfo::{FileMode, Info};
 use peer_wire::{read_message, write_message, PeerMessage, HANDSHAKE_LEN};
 use sha1::{Digest, Sha1};
@@ -331,7 +331,7 @@ async fn seeder_serves_full_torrent_to_leecher() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let seeder_addr = listener.local_addr().unwrap();
     let (seed_progress_tx, mut seed_progress_rx) = mpsc::unbounded_channel();
-    let (stop_tx, stop_rx) = mpsc::channel(1);
+    let (stop_tx, stop_rx) = mpsc::channel::<engine::SessionCommand>(1);
     let seed_path = seed_dir.path().to_path_buf();
     let seeder_torrent = torrent.clone();
     let seeder = tokio::spawn(async move {
@@ -361,7 +361,7 @@ async fn seeder_serves_full_torrent_to_leecher() {
     );
 
     // Останавливаем сидера и проверяем, что отдавал он, а не молчал.
-    stop_tx.send(()).await.unwrap();
+    stop_tx.send(SessionCommand::Shutdown).await.unwrap();
     let _ = seeder.await;
     let mut uploaded = 0u64;
     while let Ok(p) = seed_progress_rx.try_recv() {
@@ -385,7 +385,7 @@ async fn seeder_closes_connection_on_garbage_request() {
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let seeder_addr = listener.local_addr().unwrap();
-    let (_stop_tx, stop_rx) = mpsc::channel(1);
+    let (_stop_tx, stop_rx) = mpsc::channel::<engine::SessionCommand>(1);
     let seed_path = seed_dir.path().to_path_buf();
     let _seeder =
         tokio::spawn(

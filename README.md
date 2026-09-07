@@ -14,6 +14,7 @@ BitTorrent-клиент на Rust. Бесплатный, целевая плат
 | ✅ 4 | UDP-трекеры (BEP 15), раздача (seeding), choking, входящие соединения |
 | ✅ 5 | DHT (BEP 5), magnet-ссылки, extension protocol (BEP 10) + ut_metadata (BEP 9) |
 | ✅ 6 | ut_pex (BEP 11), UPnP-проброс порта, полировка peer-wire |
+| ✅ 7 | Многоторрентный daemon: реестр, accept-роутер, общий DHT, пауза in-place, персистентность списка + узлов DHT |
 
 ## Что уже работает
 
@@ -28,6 +29,12 @@ BitTorrent-клиент на Rust. Бесплатный, целевая плат
 После докачки сессия раздаёт: принимает входящие соединения, служит диск-подтверждённые куски,
 choking — round-robin + optimistic-слот. Диски пишутся отдельной задачей-писателем, pre-allocation
 (sparse).
+
+Поверх сессий — многоторрентный daemon: один TCP-порт на процесс, accept-роутер по
+info_hash, один общий DHT-клиент и NAT-маппинг, пауза/резюм in-place без recheck,
+персистентный список торрентов в app-data. Routing table DHT персистится между
+запусками — тёплый старт: первые пиры через секунды, а не после минутного холодного
+обхода. UI (Tauri, этап 8) строится поверх `DaemonHandle`.
 
 Приёмка: Debian 13.6 netinst (755 МБ) качается по `.torrent` через трекеры и по magnet без
 трекеров (чистый DHT) — в обоих случаях SHA-256 совпадает с официальным; в изолированном
@@ -62,6 +69,7 @@ cargo run --release -- "magnet:?xt=urn:btih:<40-hex>&tr=<announce-url>" ~/Downlo
 | `dht` | Kademlia DHT (BEP 5): полные k-buckets, итеративный обход, responder, `find_peers` → Stream |
 | `ext-metadata` | extension handshake + ut_metadata (BEP 9): сборка метаданных с SHA-1-проверкой, отдача чужим пирам |
 | `engine` | менеджер кусков (rarest-first, endgame), дисковый слой, сессия: скачивание + раздача + magnet-фаза (актор на mpsc), choking |
+| `daemon` | многоторрентный оркестратор: реестр, accept-роутер по info_hash, общий DHT, персистентность списка и узлов DHT, статусы для UI |
 | `cli` | сквозная проверка этапов: `.torrent` или magnet, автоопределение по префиксу |
 
 Библиотечные крейты без `unwrap`/`expect` (enforced линтами), без `unsafe`,

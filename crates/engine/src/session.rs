@@ -85,13 +85,13 @@ const NAT_RETRY_PERIOD: Duration = Duration::from_secs(600);
 /// Сколько секунд ждать unmap при разборке сессии, прежде чем abort.
 const NAT_UNMAP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Публичные bootstrap-узлы `DHT` (`BEP 5`).
-const DHT_BOOTSTRAP_HOSTS: &[&str] = &[
+/// Публичные bootstrap-узлы `DHT` (`BEP 5`); экспортируются для daemon
+/// (общий клиент этапа 7).
+pub const DHT_BOOTSTRAP_HOSTS: &[&str] = &[
     "router.bittorrent.com:6881",
     "dht.transmissionbt.com:6881",
     "router.utorrent.com:6881",
     "dht.libtorrent.org:25401",
-    "router.bitcomet.com:6881",
     "dht.aelitis.com:6881",
 ];
 
@@ -112,6 +112,82 @@ pub struct MetadataInfo {
     pub name: String,
     /// Полный размер данных в байтах.
     pub total_length: u64,
+}
+
+/// Команда управления сессией (этап 7): пауза in-place и остановка — один
+/// канал вместо отдельного shutdown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionCommand {
+    /// Остановить выдачу request'ов и отдачу; соединения держатся.
+    Pause,
+    /// Снять паузу (мгновенно, без recheck).
+    Resume,
+    /// Штатная остановка сессии (финальные Stopped-анонсы, teardown).
+    Shutdown,
+}
+
+/// Входящий пир от accept-роутера: handshake обеих сторон завершён,
+/// поток готов к `PeerEvent::InboundConnected`.
+pub struct RoutedPeer {
+    /// Адрес пира.
+    pub addr: SocketAddr,
+    /// Установленное соединение.
+    pub stream: TcpStream,
+}
+
+/// Сетевые параметры процесса для routed-сессии: порт и NAT принадлежат
+/// daemon, а не сессии (один порт и один маппинг на процесс — решение
+/// этапа 7).
+#[derive(Debug, Clone, Copy)]
+pub struct NetworkEndpoints {
+    /// Локальный TCP-порт процесса (фильтрация себя в PEX, DHT).
+    pub local_port: u16,
+    /// UPnP-маппинг процесса, если удался (внешний порт анонса).
+    pub nat: Option<nat::NatMapping>,
+}
+
+/// Источник входящих соединений сессии.
+pub enum AcceptSource {
+    /// Сессия сама принимает на своём слушателе (CLI, тесты) — поведение
+    /// этапов 3–6.
+    Own(TcpListener),
+    /// Уже рукопожатые входящие приходят от accept-роутера daemon; сетевые
+    /// параметры (порт/NAT) — процесса, не сессии.
+    Routed {
+        /// Канал уже рукопожатых входящих от роутера.
+        peers: mpsc::UnboundedReceiver<RoutedPeer>,
+        /// Сетевые параметры процесса (порт, NAT).
+        network: NetworkEndpoints,
+    },
+}
+
+/// Конфигурация сессии: общая точка входа [`run_session`]; остальные pub-функции
+/// крейта — тонкие обёртки над ней. Routed-приём и общий DHT нужны daemon,
+/// CLI/тесты используют дефолты.
+pub struct SessionConfig {
+    /// Источник содержимого: .torrent или magnet.
+    pub source: Source,
+    /// Каталог загрузки.
+    pub download_dir: PathBuf,
+    /// Источник входящих соединений.
+    pub accept: AcceptSource,
+    /// Bootstrap-узлы DHT для собственного клиента; общий клиент daemon
+    /// бутстрапит сам, поэтому здесь пусто.
+    pub dht_bootstrap: Vec<std::net::SocketAddr>,
+    /// Общий DHT-клиент процесса; `None` — сессия биндит свой на локальном
+    /// порту.
+    pub shared_dht: Option<dht::DhtClient>,
+    /// Пиры, известные заранее (интеграционные тесты с фейковыми пирами).
+    pub initial_peers: Vec<PeerHandle>,
+    /// Наш `peer_id`: daemon фиксирует его, чтобы роутер отвечал тем же;
+    /// `None` — сгенерировать на сессию.
+    pub our_peer_id: Option<[u8; 20]>,
+    /// Раздавать после полного скачивания (иначе — завершать сессию).
+    pub seed: bool,
+    /// Интервал PEX-flush (тестовый шов ускоряет).
+    pub pex_interval: Duration,
+    /// Канал управления: Pause/Resume/Shutdown. Закрытие канала = shutdown.
+    pub commands: mpsc::Receiver<SessionCommand>,
 }
 
 /// Прогресс сессии для UI.
@@ -342,14 +418,14 @@ pub async fn session(
     download_dir: &Path,
     listener: TcpListener,
     progress: Option<mpsc::UnboundedSender<Progress>>,
-    shutdown: mpsc::Receiver<()>,
+    commands: mpsc::Receiver<SessionCommand>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     session_source(
         Source::Torrent(torrent),
         download_dir,
         listener,
         progress,
-        shutdown,
+        commands,
     )
     .await
 }
@@ -367,25 +443,30 @@ pub async fn session_source(
     download_dir: &Path,
     listener: TcpListener,
     progress: Option<mpsc::UnboundedSender<Progress>>,
-    shutdown: mpsc::Receiver<()>,
+    commands: mpsc::Receiver<SessionCommand>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     let bootstrap = resolve_bootstrap(DHT_BOOTSTRAP_HOSTS).await;
     run_session(
-        source,
-        download_dir,
-        listener,
-        bootstrap,
-        Vec::new(),
+        SessionConfig {
+            source,
+            download_dir: download_dir.to_path_buf(),
+            accept: AcceptSource::Own(listener),
+            dht_bootstrap: bootstrap,
+            shared_dht: None,
+            initial_peers: Vec::new(),
+            our_peer_id: None,
+            seed: true,
+            pex_interval: PEX_INTERVAL,
+            commands,
+        },
         progress,
-        true,
-        PEX_INTERVAL,
-        shutdown,
     )
     .await
 }
 
 /// Резолвит список `host:port` в адреса (IPv4), неудачи пропускаются.
-async fn resolve_bootstrap(hosts: &[&str]) -> Vec<std::net::SocketAddr> {
+/// Публичный: daemon использует те же bootstrap-узлы для общего клиента.
+pub async fn resolve_bootstrap(hosts: &[&str]) -> Vec<std::net::SocketAddr> {
     let mut out = Vec::new();
     for host in hosts {
         match tokio::net::lookup_host(*host).await {
@@ -433,17 +514,21 @@ pub async fn download_source(
 ) -> Result<Vec<PathBuf>, EngineError> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, port)).await?;
     let bootstrap = resolve_bootstrap(DHT_BOOTSTRAP_HOSTS).await;
-    let (_keep_alive, shutdown) = mpsc::channel::<()>(1);
+    let (_keep_alive, commands) = mpsc::channel::<SessionCommand>(1);
     run_session(
-        source,
-        download_dir,
-        listener,
-        bootstrap,
-        Vec::new(),
+        SessionConfig {
+            source,
+            download_dir: download_dir.to_path_buf(),
+            accept: AcceptSource::Own(listener),
+            dht_bootstrap: bootstrap,
+            shared_dht: None,
+            initial_peers: Vec::new(),
+            our_peer_id: None,
+            seed: false,
+            pex_interval: PEX_INTERVAL,
+            commands,
+        },
         progress,
-        false,
-        PEX_INTERVAL,
-        shutdown,
     )
     .await
 }
@@ -484,16 +569,21 @@ pub async fn download_magnet_with_peers(
     progress: Option<mpsc::UnboundedSender<Progress>>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
-    let (_keep_alive, shutdown) = mpsc::channel::<()>(1);
-    session_test(
-        source,
-        download_dir,
-        listener,
-        dht_bootstrap,
-        initial_peers,
+    let (_keep_alive, commands) = mpsc::channel::<SessionCommand>(1);
+    run_session(
+        SessionConfig {
+            source,
+            download_dir: download_dir.to_path_buf(),
+            accept: AcceptSource::Own(listener),
+            dht_bootstrap,
+            shared_dht: None,
+            initial_peers,
+            our_peer_id: None,
+            seed: false,
+            pex_interval: PEX_INTERVAL,
+            commands,
+        },
         progress,
-        false,
-        shutdown,
     )
     .await
 }
@@ -511,37 +601,46 @@ pub async fn session_test(
     initial_peers: Vec<PeerHandle>,
     progress: Option<mpsc::UnboundedSender<Progress>>,
     seed: bool,
-    shutdown: mpsc::Receiver<()>,
+    commands: mpsc::Receiver<SessionCommand>,
 ) -> Result<Vec<PathBuf>, EngineError> {
     run_session(
-        source,
-        download_dir,
-        listener,
-        dht_bootstrap,
-        initial_peers,
+        SessionConfig {
+            source,
+            download_dir: download_dir.to_path_buf(),
+            accept: AcceptSource::Own(listener),
+            dht_bootstrap,
+            shared_dht: None,
+            initial_peers,
+            our_peer_id: None,
+            seed,
+            pex_interval: PEX_TEST_INTERVAL,
+            commands,
+        },
         progress,
-        seed,
-        PEX_TEST_INTERVAL,
-        shutdown,
     )
     .await
 }
 
-/// Общий каркас всех точек входа.
+/// Общий каркас всех точек входа (публичная — для daemon, этап 7).
 // Длина — последовательность этапов инициализации (анонсы, DHT, recheck,
 // accept, хаб); дробление на функции создаёт прокладки без пользы.
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-async fn run_session(
-    source: Source,
-    download_dir: &Path,
-    listener: TcpListener,
-    dht_bootstrap: Vec<std::net::SocketAddr>,
-    initial_peers: Vec<PeerHandle>,
+#[allow(clippy::too_many_lines)]
+pub async fn run_session(
+    config: SessionConfig,
     progress: Option<mpsc::UnboundedSender<Progress>>,
-    seed: bool,
-    pex_interval: Duration,
-    shutdown: mpsc::Receiver<()>,
 ) -> Result<Vec<PathBuf>, EngineError> {
+    let SessionConfig {
+        source,
+        download_dir,
+        accept,
+        dht_bootstrap,
+        shared_dht,
+        initial_peers,
+        our_peer_id: fixed_peer_id,
+        seed,
+        pex_interval,
+        commands,
+    } = config;
     let (magnet, torrent) = match source {
         Source::Torrent(torrent) => {
             if torrent.info.piece_count() == 0 {
@@ -557,19 +656,29 @@ async fn run_session(
         // Исключено конструированием Source.
         (None, None) => return Err(EngineError::InvalidTorrent("empty source")),
     };
-    let our_peer_id = tracker::peer_id();
+    let our_peer_id = fixed_peer_id.unwrap_or_else(tracker::peer_id);
     let session_key = tracker::session_key();
-    let local_port = listener.local_addr()?.port();
-    let download_dir = download_dir.to_path_buf();
 
-    // UPnP-маппинг до анонс-акторов: успех → внешний порт в анонсах/DHT.
-    // Порт 0 — эфемерный (тесты): пробрасывать бессмысленно и нечего.
-    let nat_task = if local_port != 0 {
-        Some(nat_actor(local_port).await)
-    } else {
-        None
+    // Источник входящих соединений: свой слушатель или роутер daemon;
+    // NAT/порты принадлежат сессии только в первом случае.
+    let (listener, inbound_rx, local_port, nat_task, nat_mapping) = match accept {
+        AcceptSource::Own(listener) => {
+            let local_port = listener.local_addr()?.port();
+            // UPnP-маппинг до анонс-акторов: успех → внешний порт в анонсах/DHT.
+            // Порт 0 — эфемерный (тесты): пробрасывать бессмысленно и нечего.
+            let (nat_task, nat_mapping) = if local_port != 0 {
+                let task = nat_actor(local_port).await;
+                let mapping = task.mapping;
+                (Some(task), mapping)
+            } else {
+                (None, None)
+            };
+            (Some(listener), None, local_port, nat_task, nat_mapping)
+        }
+        AcceptSource::Routed { peers, network } => {
+            (None, Some(peers), network.local_port, None, network.nat)
+        }
     };
-    let nat_mapping = nat_task.as_ref().and_then(|task| task.mapping);
     // Порт анонса: внешний из маппинга, иначе локальный.
     let announce_port = nat_mapping.map_or(local_port, |m| m.external_port);
 
@@ -598,13 +707,17 @@ async fn run_session(
     }
 
     // `DHT` для любого источника (.torrent тоже): пиры нужны всегда; UDP на том
-    // же порту, что TCP-слушатель (локальный).
-    let dht_client = match dht::DhtClient::bind(local_port).await {
-        Ok(client) => Some(client),
-        Err(err) => {
-            tracing::warn!(%err, "dht bind failed, continuing without dht");
-            None
-        }
+    // же порту, что TCP-слушатель (локальный). Общий клиент daemon подставлен
+    // заранее — биндим свой только в CLI/тестах.
+    let dht_client = match shared_dht {
+        Some(client) => Some(client),
+        None => match dht::DhtClient::bind(local_port).await {
+            Ok(client) => Some(client),
+            Err(err) => {
+                tracing::warn!(%err, "dht bind failed, continuing without dht");
+                None
+            }
+        },
     };
     let dht_forward_task = dht_client.as_ref().map(|client| {
         let client = client.clone();
@@ -652,12 +765,30 @@ async fn run_session(
         return Err(err);
     }
 
-    let accept_task = tokio::spawn(accept_loop(
-        listener,
-        info_hash,
-        our_peer_id,
-        event_tx.clone(),
-    ));
+    let accept_task = if let Some(listener) = listener {
+        tokio::spawn(accept_loop(
+            listener,
+            info_hash,
+            our_peer_id,
+            event_tx.clone(),
+        ))
+    } else {
+        // Routed-режим: handshake уже завершён роутером daemon — потоки просто
+        // пересылаются хабу. Исключено конструированием AcceptSource: без
+        // слушателя есть канал роутера.
+        let Some(mut peers) = inbound_rx else {
+            return Err(EngineError::InvalidTorrent("no accept source"));
+        };
+        let event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            while let Some(peer) = peers.recv().await {
+                let _ = event_tx.send(HubEvent::Peer(PeerEvent::InboundConnected {
+                    handle: peer.addr,
+                    stream: peer.stream,
+                }));
+            }
+        })
+    };
 
     let (piece_count, piece_length, total_length) = torrent.as_ref().map_or((0, 0, 0), |t| {
         (
@@ -703,6 +834,7 @@ async fn run_session(
         } else {
             Phase::Recheck
         },
+        paused: false,
         seed,
         chokes: ChokeManager::new(MAX_UNCHOKED),
         progress,
@@ -721,7 +853,7 @@ async fn run_session(
     }
 
     // Teardown выполняется и при ошибке цикла: соединения/актор/диск убираются всегда.
-    let session_result = session_loop(&mut hub, &mut event_rx, seed, pex_interval, shutdown).await;
+    let session_result = session_loop(&mut hub, &mut event_rx, seed, pex_interval, commands).await;
     if matches!(session_result, Ok(true)) {
         hub.send_announce(Some(Event::Completed));
         // `DHT`-анонс: заявляем себя в рой (best-effort, в фоне).
@@ -770,14 +902,15 @@ fn spawn_recheck(
     });
 }
 
-/// Основной цикл сессии: события хаба, сигнал остановки, дедлайны анонсов,
-/// choking и idle-таймер. Возвращает `Ok(true)`, когда скачивание завершено.
+/// Основной цикл сессии: события хаба, команды управления (Pause/Resume/
+/// Shutdown), дедлайны анонсов, choking и idle-таймер. Возвращает `Ok(true)`,
+/// когда скачивание завершено.
 async fn session_loop(
     hub: &mut Hub,
     event_rx: &mut mpsc::UnboundedReceiver<HubEvent>,
     seed: bool,
     pex_interval: Duration,
-    mut shutdown: mpsc::Receiver<()>,
+    mut commands: mpsc::Receiver<SessionCommand>,
 ) -> Result<bool, EngineError> {
     let mut choke_timer = tokio::time::interval(CHOKE_PERIOD);
     choke_timer.tick().await; // interval стреляет мгновенно первым тиком — поглощаем
@@ -787,6 +920,29 @@ async fn session_loop(
     let mut announce_deadline: Option<tokio::time::Instant> = None;
 
     Ok(loop {
+        // Команды управления — с приоритетом: дренаж без блокировки перед
+        // каждой итерацией. select! выбирает готовые ветки случайно — burst
+        // событий пиров мог бы откладывать паузу до конца всплеска.
+        let stop = loop {
+            match commands.try_recv() {
+                Ok(SessionCommand::Pause) => {
+                    tracing::debug!("session paused");
+                    hub.paused = true;
+                }
+                Ok(SessionCommand::Resume) => {
+                    tracing::debug!("session resumed");
+                    hub.paused = false;
+                    hub.resume_all();
+                }
+                Ok(SessionCommand::Shutdown)
+                // Канал закрыт (дроп отправителя) = shutdown — как раньше.
+                | Err(mpsc::error::TryRecvError::Disconnected) => break true,
+                Err(mpsc::error::TryRecvError::Empty) => break false,
+            }
+        };
+        if stop {
+            break false;
+        }
         tokio::select! {
             event = event_rx.recv() => {
                 let Some(event) = event else { break false }; // хаб сам держит event_tx — недостижимо
@@ -799,14 +955,22 @@ async fn session_loop(
                     }
                 }
             }
-            _ = shutdown.recv() => break false,
+            command = commands.recv() => match command {
+                Some(SessionCommand::Pause) => hub.paused = true,
+                Some(SessionCommand::Resume) => {
+                    hub.paused = false;
+                    hub.resume_all();
+                }
+                Some(SessionCommand::Shutdown) | None => break false,
+            },
             () = announce_wait(announce_deadline) => {
                 hub.send_announce(None);
                 announce_deadline = None; // до результата
             }
             _ = choke_timer.tick() => hub.recompute_chokes(),
             _ = pex_timer.tick() => hub.flush_pex(),
-            () = &mut idle, if matches!(hub.phase, Phase::Download | Phase::Metadata) =>
+            () = &mut idle,
+            if matches!(hub.phase, Phase::Download | Phase::Metadata) && !hub.paused =>
                 return Err(EngineError::IdleTimeout),
         }
         if let Some(delay) = hub.announce_next.take() {
@@ -1025,6 +1189,52 @@ async fn nat_lifecycle(
     }
 }
 
+/// UPnP-маппинг уровня процесса (этап 7): один на daemon, живёт до
+/// [`NatLease::release`]. Обёртка над `nat_actor` с публичной поверхностью.
+pub struct NatLease {
+    actor: Option<NatActor>,
+    mapping: Option<nat::NatMapping>,
+}
+
+impl NatLease {
+    /// Маппинг, если удался (внешний порт для анонсов/DHT).
+    #[must_use]
+    pub fn mapping(&self) -> Option<nat::NatMapping> {
+        self.mapping
+    }
+
+    /// Снимает маппинг: unmap с дедлайном, потом abort (зеркало teardown
+    /// анонс-акторов).
+    pub async fn release(self) {
+        if let Some(mut actor) = self.actor {
+            let _ = actor.shutdown_tx.send(());
+            if tokio::time::timeout(NAT_UNMAP_TIMEOUT, &mut actor.task)
+                .await
+                .is_err()
+            {
+                actor.task.abort();
+            }
+        }
+    }
+}
+
+/// Заводит UPnP-маппинг уровня процесса для `local_port` (порт 0 — эфемерный,
+/// тестовый: ничего не делает).
+pub async fn acquire_nat_mapping(local_port: u16) -> NatLease {
+    if local_port == 0 {
+        return NatLease {
+            actor: None,
+            mapping: None,
+        };
+    }
+    let actor = nat_actor(local_port).await;
+    let mapping = actor.mapping;
+    NatLease {
+        actor: Some(actor),
+        mapping,
+    }
+}
+
 /// Accept-луп: входящие соединения с валидным handshake становятся пирами
 /// (чужой `info_hash` — тихое закрытие). Ошибки accept не убивают сессию.
 async fn accept_loop(
@@ -1117,6 +1327,9 @@ struct Hub {
     recheck_total: usize,
     recheck_remaining: usize,
     phase: Phase,
+    /// Пауза in-place (этап 7): request'ы и отдача остановлены, соединения
+    /// и битфилд живут; idle-таймер простаивает.
+    paused: bool,
     /// Раздавать ли после полного скачивания (иначе — завершать сессию).
     seed: bool,
     chokes: ChokeManager,
@@ -2028,11 +2241,19 @@ impl Hub {
         }
     }
 
+    /// Пауза снята: заново заполняем pipeline всем живым пирам.
+    fn resume_all(&mut self) {
+        let handles: Vec<PeerHandle> = self.peers.keys().copied().collect();
+        for handle in handles {
+            self.refill(handle);
+        }
+    }
+
     /// Входящий Request: отдаём блок только заинтересованному и разчокнутому
     /// пиру (choke-состояние — источник истины), читая через задачу диска.
     fn on_upload_request(&mut self, handle: PeerHandle, index: u32, begin: u32, length: u32) {
-        if self.torrent.is_none() {
-            return; // magnet-фаза: отдавать нечего
+        if self.paused || self.torrent.is_none() {
+            return; // пауза: не отдаём; magnet-фаза: отдавать нечего
         }
         if let Some(link) = self.peers.get(&handle) {
             if !link.interested || link.our_choke {
@@ -2075,6 +2296,9 @@ impl Hub {
 
     /// Заполняет pipeline пира: выдаёт блоки, пока есть что и есть слоты.
     fn refill(&mut self, handle: PeerHandle) {
+        if self.paused {
+            return; // пауза: новых request'ов нет, уже розданные доигрываются
+        }
         let Some(link) = self.peers.get(&handle) else {
             return;
         };

@@ -182,6 +182,18 @@ impl DiskStorage {
     }
 }
 
+/// Корневой путь данных торрента под `download_dir` с санитизацией имени из
+/// .torrent (недоверенный ввод): однофайловый — файл, многофайловый — папка.
+/// Для удаления данных из daemon (этап 7) — файлы ещё НЕ создаются.
+///
+/// # Errors
+///
+/// [`EngineError::UnsafePath`] при небезопасном имени.
+pub fn torrent_root(info: &Info, download_dir: &Path) -> Result<PathBuf, EngineError> {
+    check_component(&info.name)?;
+    Ok(download_dir.join(&info.name))
+}
+
 /// Отвергает небезопасные компоненты пути из .torrent.
 fn check_component(component: &str) -> Result<(), EngineError> {
     if component.is_empty()

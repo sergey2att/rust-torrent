@@ -24,8 +24,11 @@ crates/
 ├── dht/           # Kademlia DHT (этап 5) ✅
 ├── ext-metadata/  # extension protocol + ut_metadata (этап 5) ✅
 ├── ext-pex/       # ut_pex (этап 6) ✅
-└── nat/           # UPnP/NAT-PMP (этап 6) ✅
+├── nat/           # UPnP/NAT-PMP (этап 6) ✅
+└── daemon/       # многоторрентный оркестратор: реестр, роутер, персистентность (этап 7) ✅
 ```
+
+UI-приложение (Tauri, этап 8) живёт в `app/src-tauri` — в workspace members добавляется явно, под `crates/*` не попадает.
 
 Новые крейты добавляются в `crates/` — `members = ["crates/*"]` подхватит их сам.
 
@@ -142,7 +145,44 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 5. ✅ DHT, magnet-ссылки, extension protocol + ut_metadata (приёмка: magnet без tr= по чистому DHT, Debian 13.6 netinst 755 МБ, SHA-256 совпал)
 6. ✅ ut_pex, UPnP/NAT-PMP, полировка peer-wire
 
+7. ✅ Многоторрентное ядро: переработка engine (accept-роутер по info_hash, общий DHT, Pause/Resume in-place) + крейт `daemon` (реестр, роутер, персистентность списка, статусы). Приёмка без UI — интеграционные тесты daemon с фейковыми пирами через общий порт
+8. ⏳ Tauri-приложение (UI macOS) поверх стабильного `DaemonHandle`
+9. ⏳ Подпись/дистрибуция (опционален для личного использования)
+
 Каждый новый этап начинается с прожарки требований (grill), итоги — в `GRILL-ME-stage<N>.md`.
+
+## Решения этапа 7 (не менять без обсуждения)
+
+Полный разбор — в `GRILL-ME-stage7.md`. Ключевое:
+
+- **Общая директива**: во всех развилках — промышленное/производительное решение, не ленивое. Ponytail — только к UI-обвязке, не к ядру.
+- **UI (этап 8)**: Tauri v2, WKWebView системный, Xcode не нужен (CLT достаточно). Без подписи локальная сборка запускается свободно (Gatekeeper-карантин — только на скачанное).
+- **Мульти-торрент**: один TCP-порт на процесс; accept-роутер: handshake → реестр `info_hash → отправитель хаба сессии`; чужой info_hash — тихое закрытие. Один общий DhtClient с подписками per info_hash. Один NAT-маппинг на процесс.
+- **Пауза in-place** (как libtorrent): pause() не убивает сессию — битфилд в памяти, request'ы/отдача останавливаются, resume мгновенный без recheck. Канал управления Pause/Resume рядом с shutdown; peer-задачи и PeerCommand не меняются.
+- **Персистентность**: сейчас — JSON-список (source, download_dir, paused) в app-data, восстановление со штатным recheck. Fastresume (битфилд + file stats, verify-on-demand) — отложено, TODO в `GRILL-ME-stage7.md` с триггером «recheck при старте начал раздражать».
+- **Крейт `daemon`**: реестр, роутер, общий DHT, персистентность, статусы. Engine остаётся ядром одной сессии. CLI не мигрируем.
+- **API**: async-методы на DaemonHandle (add_torrent/pause/resume/remove/statuses), типизированные Result; enum+mpsc не нужен (один потребитель в том же процессе).
+- **Статусы**: снапшот-на-подписку + события (Added/Removed/Updated/Error) ~2 Гц из одного тик-цикла; скорости — дельты кумулятивных байтов Progress. Никакого polling из UI.
+- **Удаление**: graceful teardown → опционально delete_files (sparse-преаллокация = файлы есть всегда; мультифайл = папка целиком) → чистка реестра/списка. Санитизация путей — экспортируется из engine::storage, не копипастится.
+- **Состояния**: FetchingMetadata | Rechecking{done,total} | Downloading | Seeding | Paused | Error(String). Дедуп info_hash → Err(AlreadyAdded).
+- **Тесты**: юниты без сети (реестр/роутер с инъекцией mock-стрима/персистентность/скорости/удаление) + интеграция с фейковыми пирами из engine/tests/session.rs (два торрента одновременно, пауза/резюм, remove) + #[ignore] live-magnet приёмка (magnet → progress 1.0).
+- **Зависимости**: новых для daemon нет, кандидат — serde_json для персистентности.
+- **Риск**: переустройка session.rs (accept-луп, DHT-форвардер, цикл хаба) — все существующие регресс-тесты сессий обязаны остаться зелёными без изменения семантики.
+
+### Итоги имплементации этапа 7 (found the hard way + фиксирование API)
+
+- **Новый API engine (этап 7)**: `run_session(SessionConfig, progress)` — общая точка входа; `SessionConfig { source, download_dir, accept, dht_bootstrap, shared_dht, initial_peers, our_peer_id, seed, pex_interval, commands }`; `AcceptSource::Own(TcpListener) | Routed { peers, network }` (routed — потоки уже рукопожаты роутером); `SessionCommand { Pause, Resume, Shutdown }` — ЕДИНЫЙ канал управления вместо отдельного shutdown (закрытие канала = shutdown, как раньше). Старые точки входа (`session`, `download*`, `session_test`) — тонкие обёртки, CLI/тесты не мигрировали.
+- **Ловушка bounded mpsc (критическая)**: `mpsc::Sender::send()` у ОГРАНИЧЕННОГО канала — async; `let _ = tx.send(cmd)` дропает футуру, и команда НЕ отправляется — Pause/Shutdown молча терялись (тест ловил). Любая отправка в session-канал из daemon — только `.await` (или `try_send`).
+- **Приоритет команд управления**: `select!` выбирает готовые ветки случайно — burst событий пиров откладывал обработку отложенной Pause до конца всплеска (запросы уходили в паузе). В `session_loop` перед каждой итерацией — дренаж канала команд `try_recv`-циклом; select-ветка осталась для блокирующего ожидания в idle.
+- **peer-wire**: `read_handshake` (без проверки info_hash и без ответа) + `write_handshake` — первые половины accept-обмена, вынесены для роутера; обобщены над `AsyncRead/AsyncWrite` (инъекция mock-стрима в тестах через `tokio::io::duplex`).
+- **Роутер (daemon)**: чистая функция `route_connection<S>` (читает handshake → сверяет со снапшотом карты → отвечает нашим handshake) + `accept_router` (watch-снапшот `Arc<HashMap<info_hash, Route>>`, обновляется актором при add/remove); peer_id сессии фиксируется daemon'ом (`SessionConfig.our_peer_id`), чтобы ответ роутера совпадал с сессией.
+- **Удаление файлов**: session возвращает пути при завершении (`SessionEnded`); `PendingRemoval` захватывает `download_dir` + `data_root` В МОМЕНТ remove — записи в реестре там уже нет (ловля: чтение из реестра в SessionEnded давало пустышки, файл не удалялся). Удаление — верхнеуровневые записи под download_dir (мультифайл — папка целиком); fallback-корень — `engine::torrent_root` (санитизация в engine). Magnet без метаданных — удалять нечего.
+- **daemon создаёт `download_dir` сам** (`create_dir_all` при add): engine ждёт существующий каталог (однофайловый режим).
+- **DaemonConfig.enable_upnp** — тесты выключают UPnP (ephemeral-порт не пробрасывать и роутер не дёргать).
+- **Общий DhtClient**: daemon биндит один клиент на порт процесса, сессии получают клон (`shared_dht`); bootstrap — один раз на процесс. Известное ограничение: актор DHT обрабатывает команды последовательно — обходы разных торрентов стоят в очереди (десятки секунд каждый); апгрейд — конкурентные lookup'ы в акторе dht (требует разделения владения routing table).
+- **Персистенция узлов DHT (тёплый старт)**: `DhtClient::nodes_snapshot()` (команда `DumpNodes`, до 256 ближайших узлов) → при остановке daemon пишет `{state_dir}/dht_nodes.txt` (построчно `ip:port`, best-effort, любой путь завершения цикла), при старте — читает и добавляет к стандартным bootstrap-узлам (дедуп). Фильтр служебных адресов (loopback/unspecified/порт 0) в обе стороны. Node id не персистим — при пинге придут свежие. Мёртвый `router.bitcomet.com` выкинут из `DHT_BOOTSTRAP_HOSTS`.
+- **Тесты**: интеграционные — фейковые сидеры подключаются К ПОРТУ daemon (роутер проверяется целиком, включая routing по info_hash); тестовый .torrent собирается bencode вручную — info_hash считается от ПОЛНОГО info-словаря (`d...e`), в `pieces` — хэш на КАЖДЫЙ кусок. #[ignore] live-magnet — по образцу smoke этапа 5 (фикстура Debian).
+- **Зависимости**: добавлены serde (derive) + serde_json (персистентность) — как и планировалось.
 
 ## Решения этапа 5 (не менять без обсуждения)
 

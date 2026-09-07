@@ -69,7 +69,7 @@ async fn main() -> Result<()> {
         let (stop_tx, stop_rx) = mpsc::channel(1);
         tokio::spawn(async move {
             if tokio::signal::ctrl_c().await.is_ok() {
-                stop_tx.send(()).await.ok();
+                stop_tx.send(engine::SessionCommand::Shutdown).await.ok();
             }
         });
         let dir = download_dir.clone();

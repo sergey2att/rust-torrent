@@ -177,13 +177,71 @@ pub async fn accept_handshake(
     expected_info_hash: [u8; 20],
 ) -> Result<Handshake, PeerWireError> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        let theirs = read_validate_handshake(stream, expected_info_hash).await?;
-        let out = encode_handshake(ours)?;
-        stream.write_all(&out).await?;
-        stream.flush().await?;
+        let theirs = read_handshake(stream).await?;
+        if theirs.info_hash != expected_info_hash {
+            return Err(PeerWireError::InfoHashMismatch {
+                expected: expected_info_hash,
+                got: theirs.info_hash,
+            });
+        }
+        write_handshake(stream, ours).await?;
         Ok(theirs)
     })
     .await?
+}
+
+/// Читает handshake пира без проверки `info_hash` и без ответа — первая
+/// половина accept-обмена, вынесенная для accept-роутера (этап 7): роутер
+/// должен узнать `info_hash` до того, как отвечать. Остальные проверки те же:
+/// длина строки протокола, сама строка. `reserved`/`peer_id` не валидируются.
+/// Таймаут — [`HANDSHAKE_TIMEOUT`] на всю операцию.
+///
+/// # Errors
+///
+/// [`PeerWireError::Io`] при обрыве, [`PeerWireError::InvalidProtocolLength`]
+/// / [`PeerWireError::InvalidProtocolString`] при кривом handshake.
+pub async fn read_handshake(
+    stream: &mut (impl AsyncRead + Unpin),
+) -> Result<Handshake, PeerWireError> {
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
+        let mut reply = [0u8; HANDSHAKE_LEN];
+        stream.read_exact(&mut reply).await?;
+        if reply[0] as usize != PROTOCOL_STRING.len() {
+            return Err(PeerWireError::InvalidProtocolLength(reply[0]));
+        }
+        if &reply[1..20] != PROTOCOL_STRING {
+            return Err(PeerWireError::InvalidProtocolString);
+        }
+        let mut reserved = [0u8; 8];
+        reserved.copy_from_slice(&reply[20..28]);
+        let mut info_hash = [0u8; 20];
+        info_hash.copy_from_slice(&reply[28..48]);
+        let mut peer_id = [0u8; 20];
+        peer_id.copy_from_slice(&reply[48..68]);
+        Ok(Handshake {
+            reserved,
+            info_hash,
+            peer_id,
+        })
+    })
+    .await?
+}
+
+/// Отвечает нашим handshake — вторая половина accept-обмена (для
+/// [`accept_handshake`] и accept-роутера, узнавшего `info_hash` из
+/// [`read_handshake`]).
+///
+/// # Errors
+///
+/// [`PeerWireError::Io`] при ошибке записи.
+pub async fn write_handshake(
+    stream: &mut (impl AsyncWrite + Unpin),
+    ours: &Handshake,
+) -> Result<(), PeerWireError> {
+    let out = encode_handshake(ours)?;
+    stream.write_all(&out).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Кодирует наш handshake (68 байт).
@@ -200,37 +258,20 @@ fn encode_handshake(ours: &Handshake) -> Result<Vec<u8>, PeerWireError> {
     Ok(out)
 }
 
-/// Читает 68 байт handshake пира и валидирует: длина строки протокола, строка,
-/// `info_hash` (чужой сворм бесполезен). `reserved`/`peer_id` не проверяются.
+/// Читает handshake пира, валидирует и сверяет `info_hash` — обёртка
+/// [`read_handshake`] с проверкой сворма (используется [`perform_handshake`]).
 async fn read_validate_handshake(
     stream: &mut (impl AsyncRead + Unpin),
     expected_info_hash: [u8; 20],
 ) -> Result<Handshake, PeerWireError> {
-    let mut reply = [0u8; HANDSHAKE_LEN];
-    stream.read_exact(&mut reply).await?;
-    if reply[0] as usize != PROTOCOL_STRING.len() {
-        return Err(PeerWireError::InvalidProtocolLength(reply[0]));
-    }
-    if &reply[1..20] != PROTOCOL_STRING {
-        return Err(PeerWireError::InvalidProtocolString);
-    }
-    let mut reserved = [0u8; 8];
-    reserved.copy_from_slice(&reply[20..28]);
-    let mut info_hash = [0u8; 20];
-    info_hash.copy_from_slice(&reply[28..48]);
-    let mut peer_id = [0u8; 20];
-    peer_id.copy_from_slice(&reply[48..68]);
-    if info_hash != expected_info_hash {
+    let handshake = read_handshake(stream).await?;
+    if handshake.info_hash != expected_info_hash {
         return Err(PeerWireError::InfoHashMismatch {
             expected: expected_info_hash,
-            got: info_hash,
+            got: handshake.info_hash,
         });
     }
-    Ok(Handshake {
-        reserved,
-        info_hash,
-        peer_id,
-    })
+    Ok(handshake)
 }
 
 /// Читает одно сообщение пира.
