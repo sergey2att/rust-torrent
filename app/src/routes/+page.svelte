@@ -211,10 +211,12 @@
       <section class="list">
         <div class="thead">
           <span>Торрент</span>
-          <span>Статус</span>
+          <span class="num size">Вес</span>
           <span>Прогресс</span>
           <span class="num">Скачивание</span>
           <span class="num">Раздача</span>
+          <span class="num">Осталось</span>
+          <span class="num">Пиры</span>
           <span></span>
         </div>
         {#each torrents as torrent (torrent.handle)}
@@ -324,9 +326,10 @@
   .thead {
     display: grid;
     grid-template-columns: var(--row-grid);
+    column-gap: 14px;
     padding: 10px 16px;
     border-bottom: 1px solid var(--border);
-    font-size: 11px;
+    font-size: 12px;
     color: var(--text-dim);
   }
 

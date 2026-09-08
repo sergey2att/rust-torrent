@@ -2,13 +2,21 @@
   // Прогресс-бар в стиле Transmission: бар рисуется по кускам — скачанные
   // куски сплошные, «дыры» в распределении видны (редкие куски = разрывы).
   // Данные: упакованные 2-битные состояния из engine (0 нет, 1 качается,
-  // 2 готов). Пустой массив — обычная заливка по проценту.
+  // 2 готов). Пустой массив — обычная заливка по проценту. Поверх бара —
+  // текст статуса с процентами (как в µTorrent).
   let {
     pieces,
     totalPieces,
     percent,
     doneColor,
-  }: { pieces: number[]; totalPieces: number; percent: number; doneColor: string } = $props();
+    label = "",
+  }: {
+    pieces: number[];
+    totalPieces: number;
+    percent: number;
+    doneColor: string;
+    label?: string;
+  } = $props();
 
   let canvas: HTMLCanvasElement;
   let wrapper: HTMLDivElement;
@@ -88,15 +96,31 @@
   });
 </script>
 
-<div class="wrap" bind:this={wrapper}>
+<div class="wrap" bind:this={wrapper} title={label}>
   <canvas bind:this={canvas}></canvas>
+  {#if label}<span class="label">{label}</span>{/if}
 </div>
 
 <style>
   .wrap {
     flex: 1;
-    height: 6px;
-    border-radius: 3px;
+    height: 22px;
+    border-radius: 4px;
+    overflow: hidden;
+    position: relative;
+  }
+
+  .label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: #ffffff;
+    text-shadow: 0 1px 2px rgb(0 0 0 / 85%);
+    white-space: nowrap;
     overflow: hidden;
   }
 

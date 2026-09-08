@@ -3,7 +3,7 @@
 //! Общение — mpsc-каналы: события вверх, команды вниз. Один подход на весь
 //! крейт, никаких `Mutex`.
 //!
-//! Ключевые решения этапа 4 (см. `GRILL-ME-stage4.md`):
+//! Ключевые решения этапа 4 (см. `AGENTS.md`, «Решения этапа 4»):
 //! - анонсы никогда не блокируют хаб: их делает спавнутый актор с флагом
 //!   «в полёте» (без перекрытий), результат — событие;
 //! - единая `session()`: recheck имеющихся данных → скачивание недостающего →
@@ -198,7 +198,8 @@ pub struct SessionConfig {
 /// Прогресс сессии для UI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Progress {
-    /// Скачано и проверено кусков.
+    /// Кусков, подтверждённых диском (основа процентов UI: «100%» = данные
+    /// на диске, а не в RAM).
     pub completed_pieces: usize,
     /// Всего кусков (0 — метаданные ещё не получены).
     pub total_pieces: usize,
@@ -284,8 +285,11 @@ enum PeerEvent {
 /// События для хаба.
 enum HubEvent {
     Peer(PeerEvent),
-    /// Диск: результат записи куска (число записанных байт).
-    Disk(Result<u64, std::io::Error>),
+    /// Диск: кусок записан (индекс + число байт) или ошибка записи.
+    Disk {
+        index: u32,
+        result: Result<u64, std::io::Error>,
+    },
     /// Диск: результат чтения блока для отдачи.
     Upload {
         peer: PeerHandle,
@@ -298,10 +302,9 @@ enum HubEvent {
         index: u32,
         verified: bool,
     },
-    /// Recheck завершён; хаб получает хранилище назад для задачи-писателя.
-    RecheckDone {
-        storage: DiskStorage,
-    },
+    /// Recheck завершён — `on_disk` известен полностью: время слать битфилд
+    /// и переходить к скачиванию/раздаче.
+    RecheckDone,
     /// Результат анонса.
     Announce(Result<AnnounceResponse, TrackerError>),
     /// Пиры, найденные `DHT` (или иным источником без `interval`).
@@ -760,19 +763,29 @@ pub async fn run_session(
         })
     });
 
-    // Torrent: хранилище и recheck сразу; `magnet`: только после метаданных.
+    // Torrent: хранилища и recheck сразу; `magnet`: только после метаданных.
+    // Два независимых хэндла хранилища: задача-писатель стартует немедленно,
+    // куски идут на диск с первых секунд (в т.ч. во время recheck) — в RAM
+    // не копятся, kill процесса не теряет скачанное.
     let mut paths = Vec::new();
-    let recheck_task = torrent.as_ref().map(|torrent| {
-        let storage = match DiskStorage::new(&torrent.info, &download_dir) {
-            Ok(storage) => storage,
-            Err(err) => return Err(err),
-        };
-        paths = storage.file_paths().to_vec();
-        spawn_recheck(&torrent.info, storage, event_tx.clone());
-        Ok(())
+    let (writer_storage, recheck_storage) = match torrent.as_ref() {
+        Some(t) => {
+            let writer = DiskStorage::new(&t.info, &download_dir)?;
+            let recheck = DiskStorage::new(&t.info, &download_dir)?;
+            paths = writer.file_paths().to_vec();
+            (Some(writer), Some(recheck))
+        }
+        None => (None, None),
+    };
+    let disk_task = writer_storage.map(|storage| {
+        let (disk_tx, disk_rx) = mpsc::unbounded_channel();
+        (
+            disk_tx,
+            tokio::spawn(disk_writer(storage, disk_rx, event_tx.clone())),
+        )
     });
-    if let Some(Err(err)) = recheck_task {
-        return Err(err);
+    if let (Some(t), Some(recheck)) = (torrent.as_ref(), recheck_storage) {
+        spawn_recheck(&t.info, recheck, event_tx.clone());
     }
 
     let accept_task = if let Some(listener) = listener {
@@ -819,8 +832,8 @@ pub async fn run_session(
         peers: HashMap::new(),
         tried: HashSet::new(),
         queue: VecDeque::new(),
-        disk_tx: None,
-        disk_task: None,
+        disk_tx: disk_task.as_ref().map(|(tx, _)| tx.clone()),
+        disk_task: disk_task.map(|(_, task)| task),
         event_tx,
         announce_actors,
         announce_next: None,
@@ -852,7 +865,6 @@ pub async fn run_session(
         progress,
         reset_idle: false,
         metadata_info: None,
-        pending_pieces: Vec::new(),
     };
     let has_initial_peers = !initial_peers.is_empty();
     for addr in initial_peers {
@@ -882,7 +894,8 @@ pub async fn run_session(
 }
 
 /// Запускает recheck диска в отдельной задаче: per-piece события + `RecheckDone`
-/// с хранилищем для задачи-писателя.
+/// (переход к скачиванию/раздаче). Хранилище recheck'а — свой хэндл, отдельный
+/// от задачи-писателя.
 ///
 /// Хэширование параллельно (rayon, потоков по числу ядер): одиночный SHA-1 —
 /// 1–2 ГБ/с, многогигабайтные торренты на одном потоке проверялись минутами.
@@ -923,7 +936,7 @@ fn spawn_recheck(
             }
         }
         // Хранилище возвращается хабу: после этого можно писать и читать блоки.
-        let _ = event_tx.send(HubEvent::RecheckDone { storage });
+        let _ = event_tx.send(HubEvent::RecheckDone);
     });
 }
 
@@ -1356,9 +1369,6 @@ struct Hub {
     uploaded_bytes: u64,
     /// Записей куска в задаче-писателе, чей ack ещё не пришёл.
     pending_writes: usize,
-    /// Куски, скачанные до появления задачи-писателя (recheck-фаза):
-    /// буферизуются и сливаются в диск при `RecheckDone`.
-    pending_pieces: Vec<(u32, Vec<u8>)>,
     recheck_total: usize,
     recheck_remaining: usize,
     phase: Phase,
@@ -1688,11 +1698,14 @@ impl Hub {
                 self.on_peer_event(peer_event);
                 Ok(false)
             }
-            HubEvent::Disk(result) => match result {
+            HubEvent::Disk { index, result } => match result {
                 Ok(bytes) => {
                     self.pending_writes -= 1;
                     self.downloaded_bytes += bytes;
                     self.verified_bytes += bytes;
+                    // Кусок подтверждён диском: попадает в битфилд и доступен
+                    // отдаче. Без этого скачавший для роя выглядел пустым.
+                    self.on_disk.set(index);
                     self.reset_idle = true;
                     self.emit_progress();
                     // Готово: все куски проверены и записаны.
@@ -1737,19 +1750,7 @@ impl Hub {
                 self.emit_progress();
                 Ok(false)
             }
-            HubEvent::RecheckDone { storage } => {
-                let (disk_tx, disk_rx) = mpsc::unbounded_channel();
-                self.disk_task = Some(tokio::spawn(disk_writer(
-                    storage,
-                    disk_rx,
-                    self.event_tx.clone(),
-                )));
-                // Скачанное во время recheck — первым в FIFO (порядок бесплатен).
-                let buffered = std::mem::take(&mut self.pending_pieces);
-                for (index, data) in buffered {
-                    let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
-                }
-                self.disk_tx = Some(disk_tx);
+            HubEvent::RecheckDone => {
                 self.phase = if self.pm.as_ref().is_some_and(PieceManager::is_complete) {
                     Phase::Seed
                 } else {
@@ -1920,15 +1921,12 @@ impl Hub {
                 match pm.on_block_received(handle, index, begin, &data) {
                     Ok(PieceEvent::BlockStored) => self.refill(handle),
                     Ok(PieceEvent::PieceCompleted { index, data }) => {
-                        // Кусок проверен in-memory — уходит на диск целиком,
-                        // испорченные куски диск не касаются. Пока задачи-
-                        // писателя нет (recheck-фаза), буферизуем.
+                        // Кусок проверен in-memory — на диск целиком; ack
+                        // вернёт индекс и поднимет on_disk (битфилд/отдача/
+                        // честный процент UI).
                         self.pending_writes += 1;
-                        match &self.disk_tx {
-                            Some(disk_tx) => {
-                                let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
-                            }
-                            None => self.pending_pieces.push((index, data)),
+                        if let Some(disk_tx) = &self.disk_tx {
+                            let _ = disk_tx.send(DiskCommand::WritePiece { index, data });
                         }
                         self.refill(handle);
                     }
@@ -2189,9 +2187,19 @@ impl Hub {
         let piece_length = info.piece_length;
         let total_length = info.total_length();
 
-        let storage = DiskStorage::new(&info, &self.download_dir)?;
-        self.paths = storage.file_paths().to_vec();
-        spawn_recheck(&info, storage, self.event_tx.clone());
+        // Два хэндла хранилища — как в `.torrent`-пути: писатель стартует
+        // немедленно, recheck читает из своего (куски не копятся в RAM).
+        let writer_storage = DiskStorage::new(&info, &self.download_dir)?;
+        let recheck_storage = DiskStorage::new(&info, &self.download_dir)?;
+        self.paths = writer_storage.file_paths().to_vec();
+        let (disk_tx, disk_rx) = mpsc::unbounded_channel();
+        self.disk_task = Some(tokio::spawn(disk_writer(
+            writer_storage,
+            disk_rx,
+            self.event_tx.clone(),
+        )));
+        self.disk_tx = Some(disk_tx);
+        spawn_recheck(&info, recheck_storage, self.event_tx.clone());
         let pm = PieceManager::new(&info);
 
         let trackers = std::mem::take(&mut self.magnet_trackers);
@@ -2456,7 +2464,11 @@ impl Hub {
                 )
             });
             let _ = tx.send(Progress {
-                completed_pieces: self.pm.as_ref().map_or(0, PieceManager::completed_pieces),
+                // Проценты — только по кускам, подтверждённым диском: «100%»
+                // всегда означает, что данные на диске. RAM-верификация до
+                // ack записи завершением не считается (kill не теряет данные
+                // «под видом скачанных»).
+                completed_pieces: self.on_disk.count_set(),
                 total_pieces: self.piece_count,
                 downloaded_bytes: self.downloaded_bytes,
                 uploaded_bytes: self.uploaded_bytes,
@@ -2471,7 +2483,8 @@ impl Hub {
 }
 
 /// Задача-писатель: единственный владелец `DiskStorage`. FIFO-канал гарантирует
-/// порядок записей кусков; ack возвращает хабу число записанных байт.
+/// порядок записей кусков; ack возвращает хабу индекс куска (для `on_disk`)
+/// и число записанных байт.
 async fn disk_writer(
     storage: DiskStorage,
     mut rx: mpsc::UnboundedReceiver<DiskCommand>,
@@ -2485,12 +2498,18 @@ async fn disk_writer(
                 let bytes = data.len() as u64;
                 match tokio::task::spawn_blocking(move || {
                     let mut current = current;
-                    let result = current.write_piece(index, &data);
-                    (current, result.map(|()| bytes))
+                    let result = current.write_piece(index, &data).map(|()| bytes);
+                    (current, result)
                 })
                 .await
                 {
-                    Ok((current, outcome)) => (current, HubEvent::Disk(outcome)),
+                    Ok((current, outcome)) => (
+                        current,
+                        HubEvent::Disk {
+                            index,
+                            result: outcome,
+                        },
+                    ),
                     Err(join) => return Err(std::io::Error::other(join).into()),
                 }
             }

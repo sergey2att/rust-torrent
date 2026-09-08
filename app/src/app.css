@@ -16,7 +16,7 @@
   --yellow: #e0b64f;
   --purple: #a08df5;
   --radius: 4px;
-  --row-grid: minmax(0, 1fr) 130px 190px 92px 92px 64px;
+  --row-grid: minmax(0, 1fr) 72px 300px 92px 92px 96px 52px 64px;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -34,7 +34,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  font-size: 13px;
+  font-size: 14px;
   user-select: none;
 }
 

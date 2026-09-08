@@ -712,3 +712,136 @@ async fn full_pool_evicts_useless_seed_for_inbound_newcomer() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
+
+/// Регрессия «скачавший для роя выглядел пустым»: `on_disk` раньше поднимался
+/// только речеком (ack записи не нёс индекса куска) — битфилд скачавшего
+/// оставался пустым, отдача отказывала, а UI рисовал 100% по RAM-состоянию
+/// (kill процесса терял «скачанное»). Теперь скачавший без речека отдаёт
+/// куски входящему пиру и репортит только диск-подтверждённые куски.
+#[tokio::test]
+async fn downloaded_leecher_serves_pieces_and_reports_disk_backed_progress() {
+    let (torrent, pieces) = test_torrent(1024, 2 * 1024);
+    let expected: Vec<u8> = pieces.iter().flatten().copied().collect();
+
+    // Источник данных — фейковый сидер; у нашего скачавшего речека не было.
+    let (seeder, _counts) = spawn_fake_peer(pieces.clone(), Behavior::Normal).await;
+    let dir = tempfile::tempdir().unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let session_addr = listener.local_addr().unwrap();
+
+    let (progress_tx, mut progress_rx) = mpsc::unbounded_channel();
+    let (stop_tx, stop_rx) = mpsc::channel::<SessionCommand>(1);
+    let session_torrent = torrent.clone();
+    let session_dir = dir.path().to_path_buf();
+    let session = tokio::spawn(async move {
+        engine::session_test(
+            Source::Torrent(session_torrent),
+            &session_dir,
+            listener,
+            Vec::new(),
+            vec![seeder],
+            Some(progress_tx),
+            true,
+            stop_rx,
+        )
+        .await
+    });
+
+    // Ждём диск-подтверждённые 100%: completed_pieces теперь считается по
+    // on_disk (ack записи), а не по RAM-верификации кусков.
+    let total = pieces.len();
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while let Some(p) = progress_rx.recv().await {
+            if p.completed_pieces == total {
+                return;
+            }
+        }
+        panic!("прогресс-канал закрылся до завершения скачивания");
+    })
+    .await
+    .expect("диск-подтверждённые 100% не достигнуты");
+
+    // Файл на диске полон и корректен.
+    let content = std::fs::read(dir.path().join("test-dl")).unwrap();
+    assert_eq!(content, expected, "файл на диске обязан быть полным");
+
+    // Входящий пир запрашивает кусок у скачавшего — тот обязан отдать.
+    inbound_peer_requests_piece(session_addr, 1, &pieces[1], true).await;
+
+    stop_tx.send(SessionCommand::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), session)
+        .await
+        .expect("сессия не остановилась")
+        .unwrap()
+        .expect("сессия завершилась с ошибкой");
+}
+
+/// Входящий личер: handshake → interested → (bitfield) → unchoke → request →
+/// кусок. `expect_nonempty_bitfield` — регрессия пустого битфилда у скачавшего.
+async fn inbound_peer_requests_piece(
+    addr: PeerHandle,
+    index: u32,
+    expected_block: &[u8],
+    expect_nonempty_bitfield: bool,
+) {
+    let mut client = TcpStream::connect(addr).await.unwrap();
+    // Входящий: клиент шлёт handshake первым, потом получает ответ сессии.
+    let mut intro = Vec::with_capacity(HANDSHAKE_LEN);
+    intro.push(19);
+    intro.extend_from_slice(b"BitTorrent protocol");
+    intro.extend_from_slice(&[0u8; 8]);
+    intro.extend_from_slice(&INFO_HASH);
+    intro.extend_from_slice(&[9u8; 20]);
+    client.write_all(&intro).await.unwrap();
+    client.flush().await.unwrap();
+    let mut buf = [0u8; HANDSHAKE_LEN];
+    client.read_exact(&mut buf).await.unwrap();
+    write_message(&mut client, &PeerMessage::Interested)
+        .await
+        .unwrap();
+
+    // До unchoke может прилететь bitfield — у скачавшего он НЕ пустой.
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_message(&mut client))
+            .await
+            .expect("сообщение от скачавшего не пришло")
+            .unwrap();
+        match msg {
+            PeerMessage::Bitfield(bytes) => {
+                assert!(
+                    !expect_nonempty_bitfield || bytes.iter().any(|&b| b != 0),
+                    "битфилд скачавшего пуст — рой считает его не имеющим кусков"
+                );
+            }
+            PeerMessage::Unchoke => break,
+            _ => {}
+        }
+    }
+
+    write_message(
+        &mut client,
+        &PeerMessage::Request {
+            index,
+            begin: 0,
+            length: 1024,
+        },
+    )
+    .await
+    .unwrap();
+    loop {
+        let msg = tokio::time::timeout(Duration::from_secs(10), read_message(&mut client))
+            .await
+            .expect("кусок от скачавшего не пришёл")
+            .unwrap();
+        if let PeerMessage::Piece {
+            index: piece,
+            begin: offset,
+            block,
+        } = msg
+        {
+            assert_eq!((piece, offset), (index, 0));
+            assert_eq!(block, expected_block, "отдан не тот кусок");
+            return;
+        }
+    }
+}

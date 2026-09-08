@@ -503,6 +503,15 @@ impl Bitfield {
             && self.bytes.iter().map(|&b| b.count_ones()).sum::<u32>() as usize == self.piece_count
     }
 
+    /// Сколько битов установлено (кусков есть).
+    #[must_use]
+    pub fn count_set(&self) -> usize {
+        self.bytes
+            .iter()
+            .map(|&b| b.count_ones() as usize)
+            .sum::<usize>()
+    }
+
     /// Число кусков, на которое рассчитана карта.
     pub fn piece_count(&self) -> usize {
         self.piece_count
