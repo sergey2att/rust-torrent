@@ -1,6 +1,6 @@
 //! Персистентность списка торрентов (этап 7): JSON в каталоге состояния +
-//! блобы .torrent. Fastresume (битфилд + file stats) — отложено, TODO в
-//! `GRILL-ME-stage7.md` (триггер: «recheck при старте начал раздражать»).
+//! блобы .torrent. Fastresume (битфилд + file stats) — отложено, TODO-FASTRESUME
+//! в `AGENTS.md` (триггер: «recheck при старте начал раздражать»).
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -1,6 +1,6 @@
 # AGENTS.md
 
-BitTorrent-клиент на Rust. Бесплатный, целевая платформа — macOS, но ядро платформонезависимо.
+BitTorrent-клиент на Rust для macOS с платформонезависимым ядром.
 
 ## Стек
 
@@ -28,7 +28,7 @@ crates/
 └── daemon/       # многоторрентный оркестратор: реестр, роутер, персистентность (этап 7) ✅
 ```
 
-UI-приложение (Tauri, этап 8) живёт в `app/src-tauri` — в workspace members добавляется явно, под `crates/*` не попадает. Код готов и отполирован ✅ (тёмная тема getquin, Transmission-бар кусков; ручной чек-лист приёмки — в `GRILL-ME-stage8.md`).
+UI-приложение (Tauri, этап 8) живёт в `app/src-tauri` — в workspace members добавляется явно, под `crates/*` не попадает. Код готов и отполирован ✅ (тёмная тема getquin, Transmission-бар кусков; ручной чек-лист приёмки — в конце раздела «Решения этапа 8» этого файла).
 
 Новые крейты добавляются в `crates/` — `members = ["crates/*"]` подхватит их сам.
 
@@ -66,6 +66,8 @@ RUST_LOG=engine=debug cargo run --release -p cli -- ...      # трассиро�
 cargo test -p cli -- --ignored --nocapture   # ручной smoke: реальный трекер + живой пир
 cargo clippy --all-targets -- -D warnings   # must be clean (0 warnings)
 cargo fmt                               # форматирование перед коммитом
+cd app && npm run check && npm run build   # UI: svelte-check (0 ошибок) + сборка фронтенда
+cd app && npm run tauri dev             # запуск UI-приложения в dev-режиме
 ```
 
 ## Линты
@@ -89,7 +91,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 
 ## Решения этапа 1 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage1.md`. Ключевое:
+Ключевое:
 
 - **`BValue::Dict(BTreeMap<Vec<u8>, BValue>)`** — порядок вставки не сохраняем; «ловушка порядка» неактуальна, т.к. info_hash считается из сырых байт, а не из пересериализации.
 - **info_hash** — SHA-1 от `&bytes[info_span]`, срез берётся из `bencode::decode_top_dict_with_spans`. Никогда не пересериализовывать `info` для хэша.
@@ -102,7 +104,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 
 ## Решения этапа 2 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage2.md`. Ключевое:
+Ключевое:
 
 - **tracker**: reqwest (дефолтные фичи с TLS), таймаут announce — константа внутри крейта (15 с). Пирсинг ответа — наш `bencode::decode`: compact-пиры основной формат (некратная длина 6 → `InvalidPeers`), фолбэк на список словарей; `failure reason` → `TrackerFailure(String)`; `peers6`/warning reason — отложены (YAGNI).
 - **Query-кодирование**: percent-encoding по сырым байтам, набор = `NON_ALPHANUMERIC` минус unreserved `-._~` (сам `NON_ALPHANUMERIC` кодирует и их — ловушка). Сборка query вручную (`query_pairs_mut` портит бинарные данные), существующие параметры announce-URL сохраняются; `compact=1` всегда, `event`/`numwant` — только при `Some`.
@@ -113,6 +115,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - **Таймауты**: 15 с handshake / 60 с download_block / 15 с announce — на всю операцию, константы в крейтах; `Timeout` — отдельный вариант ошибки.
 - **Зависимости**: tracker = thiserror, reqwest, percent-encoding, url, fastrand, bencode; peer-wire = thiserror, tokio (net/io-util/time) — без bencode; никаких serde/byteorder (from_be_bytes/to_be_bytes).
 - **Фолбэк трекеров**: при `TrackerFailure`/HTTP-ошибке cli не переключается на announce-list автоматически — живой трекер подтверждается вручную (Ubuntu-трекер бывает в maintenance, Debian/opentrackr работают).
+- **Лимиты** (таймауты, 1 МиБ) — константы; поднимать только по реальным наблюдениям, не на всякий случай.
 
 ## Тесты и фикстуры
 
@@ -125,16 +128,19 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 
 ## Решения этапа 3 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage3.md`. Ключевое:
+Ключевое:
 
 - **Архитектура**: актор на mpsc — хаб владеет `PieceManager`, peer-задачи и диск-таск общаются каналами; диск — отдельная задача-писатель (FIFO-канал: порядок WritePiece бесплатен, verify in-memory до диска).
 - **Чтение пиров — отдельная задача-читатель, владеющая read-half сокета**. Чтения никогда не отменяются на полпути: гонка `select!` с командным каналом теряла недочитанные байты и рассинхронизировала поток (все пиры умирали на «message too large»). Главное правило: в `select!` гоняются только cancel-safe `recv()` каналов.
 - **Неизвестные message ID пропускаются** (BEP 10, id 20 шлют все современные клиенты) — отклонение от «ревизии на этапах 5–6», вызванное реальным свормом.
 - **Pipeline**: 5 request на соединение, рефилл после КАЖДОГО принятого блока (не только после завершения куска — иначе стагнация).
 - **Блоки/куски**: rarest-first со случайным тай-брейком, частичные куски приоритетнее, блоки ≤16 КиБ; endgame — дубликат при пустом пуле, Cancel остальным.
-- **Re-announce**: `clamp(tracker_interval, 30 с, 5 мин)` — отклонение от `max(interval, 30 с)`: трекеры дают interval 1800 с > idle-таймаута 10 мин, сессия умирала раньше следующего анонса.
+- **Re-announce**: `clamp(tracker_interval, 30 с, 5 мин)` — отклонение от `max(interval, 30 с)`: трекеры дают interval 1800 с > idle-таймаута 10 мин, сессия умирала раньше следующего анонса. numwant=50; финальный announce `event=Completed`.
 - **Соединения**: лимит 50, дедуп адресов без ре-коннекта, connect+handshake 10 с, read-таймаут 120 с; ошибки peer-задачи — тихое выбытие.
-- **Диск**: pre-allocation `set_len` (sparse), санитизация путей с полным отказом (`UnsafePath`), `u64` размеры.
+- **Диск**: pre-allocation `set_len` (sparse), санитизация путей с полным отказом (`UnsafePath` на `../`, пустые компоненты, `/`, `\\`, абсолютные пути — никаких тихих переписываний), `u64` размеры.
+- **Сборка куска**: по begin-смещениям (порядок прихода не гарантирован); незапрошенный/дубликат блок игнорируется без изменения состояния; блоки внутри куска — по возрастанию begin; при mismatch — сброс буфера, in-flight куска в пул, перекачка.
+- **In-flight и стейт-машина пира**: in-flight учитывается по пиру (`PeerHandle = SocketAddr`), возвращается в пул при disconnect/timeout/choke; Choke сбрасывает недополученные request'ы пира в пул; Have → on_peer_have; повторный Bitfield — ошибка протокола.
+- **Память**: буферы частичных кусков in-memory (worst case ~piece_length × число параллельных частичных кусков) — следить при больших piece_length.
 
 ## План этапов
 
@@ -146,20 +152,20 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 6. ✅ ut_pex, UPnP/NAT-PMP, полировка peer-wire
 
 7. ✅ Многоторрентное ядро: переработка engine (accept-роутер по info_hash, общий DHT, Pause/Resume in-place) + крейт `daemon` (реестр, роутер, персистентность списка, статусы). Приёмка без UI — интеграционные тесты daemon с фейковыми пирами через общий порт
-8. 🔶 Tauri-приложение (UI macOS) поверх стабильного `DaemonHandle` — код готов и отполирован (grill-итоги в `GRILL-ME-stage8.md`); из ручного чек-листа приёмки не пройдены только живые пункты UI
+8. 🔶 Tauri-приложение (UI macOS) поверх стабильного `DaemonHandle` — код готов и отполирован; из ручного чек-листа приёмки не пройдены только живые пункты UI
 9. ⏳ Подпись/дистрибуция (опционален для личного использования)
 
-Каждый новый этап начинается с прожарки требований (grill), итоги — в `GRILL-ME-stage<N>.md`.
+Каждый новый этап начинается с прожарки требований (grill), итоги — в разделах «Решения этапа N» этого файла.
 
 ## Решения этапа 7 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage7.md`. Ключевое:
+Ключевое:
 
 - **Общая директива**: во всех развилках — промышленное/производительное решение, не ленивое. Ponytail — только к UI-обвязке, не к ядру.
 - **UI (этап 8)**: Tauri v2, WKWebView системный, Xcode не нужен (CLT достаточно). Без подписи локальная сборка запускается свободно (Gatekeeper-карантин — только на скачанное).
 - **Мульти-торрент**: один TCP-порт на процесс; accept-роутер: handshake → реестр `info_hash → отправитель хаба сессии`; чужой info_hash — тихое закрытие. Один общий DhtClient с подписками per info_hash. Один NAT-маппинг на процесс.
 - **Пауза in-place** (как libtorrent): pause() не убивает сессию — битфилд в памяти, request'ы/отдача останавливаются, resume мгновенный без recheck. Канал управления Pause/Resume рядом с shutdown; peer-задачи и PeerCommand не меняются.
-- **Персистентность**: сейчас — JSON-список (source, download_dir, paused) в app-data, восстановление со штатным recheck. Fastresume (битфилд + file stats, verify-on-demand) — отложено, TODO в `GRILL-ME-stage7.md` с триггером «recheck при старте начал раздражать».
+- **Персистентность**: сейчас — JSON-список (source, download_dir, paused) в app-data, восстановление со штатным recheck. **TODO-FASTRESUME** (отложено): resume-файл с битфилдом + file stats; при старте stat вместо recheck; verify-on-demand (проверка хэша куска перед служением/докачкой). Крупнейшая недостающая подсистема engine: вводит состояние «кусок на диске, но хэш не подтверждён», ломает инвариант этапа 3 «служим только диск-подтверждённым», требует verify-on-demand путь в DiskStorage/PieceManager. Триггер «когда брать»: recheck при старте начал раздражать — померить тайминг recheck логом.
 - **Крейт `daemon`**: реестр, роутер, общий DHT, персистентность, статусы. Engine остаётся ядром одной сессии. CLI не мигрируем.
 - **API**: async-методы на DaemonHandle (add_torrent/pause/resume/remove/statuses), типизированные Result; enum+mpsc не нужен (один потребитель в том же процессе).
 - **Статусы**: снапшот-на-подписку + события (Added/Removed/Updated/Error) ~2 Гц из одного тик-цикла; скорости — дельты кумулятивных байтов Progress. Никакого polling из UI.
@@ -186,7 +192,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 
 ## Решения этапа 5 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage5.md`. Ключевое:
+Ключевое:
 
 - **dht**: полные k-buckets (k=8), а не плоский кэш; публичный контракт — `find_peers` → `impl Stream` (dep futures-core, без рантайма), внутри актор + mpsc. Полный responder (ping/find_node/get_peers/announce_peer, token TTL 5 мин, error 203 без token). Константы: α=3, KRPC timeout 2 с без ретраев, tx-id 2 байта, кэш пиров 256/info_hash, budget обхода 96.
 - **Ловушка обхода (found the hard way)**: капа кандидатов — только по НЕопрошенным (`candidates.retain(!queried)`), иначе фронт вырождается и обход останавливается на 16 узлах, не дойдя до values; `merge_candidates` сортирует по расстоянию до **target**, не до себя. Декремент бюджета — в момент пуша кандидата, не при отправке: иначе при budget 1..2 и пуше ALPHA=3 — underflow и смерть актора (регресс-тест в `dht/src/lib.rs`, шов `lookup(..., budget)`).
@@ -196,10 +202,11 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - **PeerEvent::Bitfield несёт сырые байты**: валидация `Bitfield::from_wire` в хабе (в magnet-фазе piece_count ещё неизвестен); Extended-сообщения маршрутизирует хаб по содержимому (Request/Data/Reject), не только по ext_id (чужой id не фиксирован).
 - **CLI**: аргумент — `.torrent` или magnet (автоопределение по префиксу); `HubEvent::Metadata` (имя+размер) для прогресса до начала скачивания.
 - **Зависимости**: futures-core (dht), больше новых нет — bencode/sha1/fastrand уже в дереве.
+- **Прочее**: наш ext handshake `{"m":{"ut_metadata":2,"ut_pex":3},"v":"RT 1.0"}` + metadata_size после сбора; bootstrap-пинг — 3 ретрая; в ответе nodes — до 8 ближайших, принимаем ≤16; периодический refresh routing table отложен — после долгого простоя таблица stale (для наших сценариев приемлемо).
 
 ## Решения этапа 4 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage4.md`. Ключевое:
+Ключевое:
 
 - **UDP-announce (BEP 15)**: stateless — каждый announce = connect → announce, connection_id не кэшируется (single-torrent сессия, hit rate кэша ~0%). Ретраи строго по спеке: 15 с × 2ⁿ, 8 попыток, шов для тестов — внутренняя `announce_udp_impl(base: Duration)`; после 8-й — `TrackerError::Timeout`. Поле `key` генерируется раз на сессию (`tracker::session_key()`), numwant None → `0xFFFFFFFF`. Ловушка: UDP-коды событий не по порядку enum (completed=1, started=2, stopped=3) — тест на маппинг.
 - **Единый `tracker::announce(url)`**: udp → lookup_host (предпочитаем IPv4) → `announce_udp`; http(s) → `announce_http`; иное → `UnsupportedScheme`. Путь в udp:// игнорируется. Engine анонсирует только через него.
@@ -212,7 +219,7 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 
 ## Решения этапа 6 (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage6.md`. Ключевое:
+Ключевое:
 
 - **ext-pex (BEP 11)**: чистый кодек + константы (`OUR_UT_PEX_ID=3`, `PEX_INTERVAL=60 с`, кап 1000, `PEX_MIN_INTERVAL=1 с`); только IPv4 (`added6` — YAGNI). Парсер: отсутствующие ключи = пустые; структурный мусор (длины, `added.f`, хвостовые байты) → ошибка; кап 1000 → `TooManyAdded/Dropped` (disconnect на стороне engine). 17 юнит-тестов по DoD (BEP-примеры, обрывы на каждом суффиксе, мусор после валидных данных, границы).
 - **Outbox-модель Transmission**: хаб — единственный владелец истины о сворме, per-recipient `PexOutbox` (added/dropped + `full_sent`); первый flush — полный список (лениво, на момент flush — гонки «пир подключился до handshake» не теряют участников), дальше дельты. Исключения: получатель, порт 0, свой адрес (`is_self`: UPnP-external или loopback+локальный порт). В outbox — только реальные соединения (verified-only, анти-poisoning).
@@ -224,10 +231,22 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - **Приёмка PEX**: A и B — реальные engine (A знает только B, B — только C), C — фейковый seeder со счётом РАЗНЫХ peer_id handshake'ов; критерий — второе рукопожатие от A на C. Ловушка: личер A в фазе Seed не дозванивается из очереди — данные от C подаются с задержкой 100 мс/блок, чтобы A гарантированно оставался в Download к моменту flush. Плюс юниты: «пир без ut_pex не получает PEX» и «сидер в added несёт 0x02».
 - **Зависимости**: ext-pex = bencode+thiserror; nat = igd-next+thiserror (без tokio — крейт блокирующий); engine = + ext-pex, nat; dev-dep engine — tracing-subscriber (диагностика приёмки).
 - **DHT для любого источника**: изначально DHT-клиент биндился только в magnet-сессии — `.torrent` оставался без пиров, если трекеры недоступны (ловля на живой раздаче за Cloudflare-блоком). DHT включён всегда; `DiscoveredPeers` хаб обрабатывал без гейта, сломан был только бинд.
+- **TODO/потолки этапа 6**: флаги `added.f` на приёме парсим, потребителя нет — seeder-priority отложено; burst PEX при глобальном тикере — ≤50 сообщений раз в 60 с, при переходе на 1000+ пиров переделать в общий кольцевой буфер.
+
+### MSE — заметки на будущее (не реализовано)
+
+Задел по неофициальной спецификации MSE (PE, MessWithMS) — при старте этапа сделать свой grill (минимум решений: DH-библиотека, пассивный перебор, таймауты, fallback на plain, SKEY-only).
+
+- **Обмен ключами**: DH с модульсом `p = 2^607 − 1` (простое Мерсенна), приватный ключ — 160 случайных бит; обмен Ya/Za поверх TCP **до** BitTorrent-handshake; секрет `s = Ze^Ya mod p`, ключи через `HASH('keyA', s, Ya, Ze)` / `HASH('keyB', s, ...)`; RC4-ключи дропают первые 1024 байта.
+- **Активация**: инициатор пишет первый байт `0x80` вместо длины `19`; в reserved-битах BT-handshake биты 0x0F/0x10 сигналят поддержку.
+- **crypto_provide**: 0x01 = Plain, 0x02 = RC4; выбор стороны — `crypto_select`.
+- **SKEY**: 20-байтовый info_hash в инициализаторе → пассивная сторона (наш listener) подбирает ключ без перебора — критично для входящих magnet-соединений.
+- **Архитектура**: MSE — оверлайн поверх TCP **до** peer-wire-фреймера: соединение оборачивается в крипто-стрим (`AsyncRead/AsyncWrite` wrapper) до фреймера. Изменения — peer-wire + модуль шифрования; engine не трогается.
+- **Ловушки**: VC-проверка (`HASH('req1', s)`) обязательна (устойчивость к DPI); невалидные crypto_provide/select → disconnect; падение на Plain при согласованном RC4 — атака, выбор шифрования фиксировать только после VC.
 
 ## Решения этапа 8 / полировка (не менять без обсуждения)
 
-Полный разбор — в `GRILL-ME-stage8.md`. Ключевое:
+Ключевое:
 
 - **Сидер**: DHT-announce при входе в Seed + повтор каждые 10 мин (`enter_seed_mode`); дозвоны в Seed-фазе разрешены (гейты `phase != Recheck`). Регресс: `seeding_session_dials_out_to_peer_from_tracker_announce`. Отдача подтверждена сквозной приёмкой мини-личером (`UPLOAD WORKS` — ext handshake → bitfield → unchoke → кусок).
 - **Вытеснение бесполезных пиров**: пул полон → входящий новичок выгоняет сида с полным битфилдом и not-interested (как в Transmission). Регресс: `full_pool_evicts_useless_seed_for_inbound_newcomer` (мутация «вытеснение отключено» роняет тест).
@@ -237,3 +256,22 @@ Rust ставится через rustup: `source "$HOME/.cargo/env"` в ново
 - **«Offset-66» — ложный след**: тестовый python-личер слал peer_id 22 символа (handshake 70 байт вместо 68); сидер корректно прочитал 68, хвост `zz` читался как префикс → `message too large`. Урок: сначала дампить байты, потом искать гонки. Диагностика: `peek()` после `accept_handshake` + сырой дамп потока личера.
 - **Закрытие окна ≠ выход**: на macOS крестик оставляет приложение жить без окон (нативное поведение AppKit), `ExitRequested` не приходит — процесс в терминале остаётся (фича для сидера: раздача продолжается). Штатный выход — Cmd+Q: `ExitRequested` → `daemon.shutdown()` (анонсы Stopped, дедлайн 15 с, NAT unmap).
 - **Зависимости**: новых нет (rayon добавлен ранее для параллельного recheck).
+- **Скелет UI**: официальный шаблон `create-tauri-app` (svelte-ts) → Svelte 5 + SvelteKit SPA (`@sveltejs/adapter-static`, fallback `index.html`); App Sandbox выключен (нужны TCP/UDP порты).
+- **Мост**: один tokio-рантайм (`tauri::async_runtime`); daemon стартует в setup, `DaemonHandle` — в AppState; события daemon → один поток `torrent-event`; команды — тонкие обёртки над async-методами handle, ошибки — `String` для UI; состояние UI — снапшот `get_all_statuses` при старте + события, upsert по handle (keyed-строки, обновления 2 Гц без перестановок).
+- **serde-контракт UI**: `TorrentStatus`/`TorrentState`/`TorrentEvent` в daemon с `Serialize/Deserialize` (формат без тега: unit-варианты — строки, варианты с данными — вложенный словарь); контракт закреплён тестами в `crates/daemon/src/status.rs`; дублирующих DTO в приложении нет.
+- **Конфигурация**: порты 6881–6889 (исторический BT-диапазон), фолбэк — эфемерный 0; каталог состояния — `<app_data_dir>/daemon-state`.
+- **Параллельный recheck**: позиционные чтения `pread` (unix `read_exact_at` — без общего seek-курсора, конкурентно-безопасно; fallback seek+read на не-unix) + rayon батчами по 64 куска, события прогресса — на батч.
+- **Уведомление о завершении**: `tauri-plugin-notification`, системный banner при переходе в Seeding из активной докачки (Downloading/Rechecking/FetchingMetadata); resume уже завершённого и восстановленный при старте снапшот Seeding — без уведомления.
+- **Ловушка Cargo.toml**: профиль `[profile.release]` (lto, strip, codegen-units=1, panic=abort) — только в корневом `Cargo.toml`, в некорневом члене workspace он игнорируется.
+
+#### Ручной чек-лист приёмки (живые пункты UI — не пройдены)
+
+Запуск: `cd app && npm install && npm run tauri dev` (первый запуск собирает Rust ~минуты).
+
+1. Диалог «+ .torrent» → добавление, recheck → прогресс.
+2. Drag-and-drop .torrent на окно.
+3. Magnet-строка → «Получение метаданных…» → скачивание через DHT.
+4. Пауза/резюм — мгновенные, прогресс не сбрасывается.
+5. Удаление с файлами и без (sparse-преаллокация: файлы есть всегда).
+6. Дедуп: повторное добавление того же торрента → баннер «already added».
+7. Штатный выход (Cmd+Q): анонсы `Stopped`, NAT unmap, процесс завершается без зависаний.

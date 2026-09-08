@@ -1,6 +1,6 @@
 //! Tauri-приложение (этап 8) поверх стабильного API [`daemon::DaemonHandle`].
 //!
-//! Решения прожарки — в `GRILL-ME-stage7.md`, раздел 11: один tokio-рантайм
+//! Решения прожарки этапов 7/8 — в `AGENTS.md`: один tokio-рантайм
 //! (`tauri::async_runtime`), daemon стартует в setup, события daemon
 //! пересылаются в UI одним потоком `torrent-event`, teardown при выходе —
 //! `daemon.shutdown()` (анонсы `Stopped`, unmap NAT) с внутренним дедлайном.
@@ -225,6 +225,15 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        // Крестик окна = штатный выход: без этого macOS оставляет процесс
+        // жить без окон (нативное поведение AppKit) — выглядело как зависание,
+        // пользователи закрывали принудительно и теряли RAM-состояние сессий.
+        // exit() запускает ExitRequested → блок shutdown ниже (с дедлайнами).
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                window.app_handle().exit(0);
+            }
+        })
         .setup(|app| {
             let app_handle = app.handle().clone();
             let state_dir = app_handle.path().app_data_dir()?.join("daemon-state");
